@@ -52,24 +52,8 @@ pub fn minflt(who: i32) -> i64 {
 
 pub fn detect_pages() {
     let never = std::fs::read("/sys/kernel/mm/transparent_hugepage/enabled").is_ok_and(|s| s.windows(7).any(|w| w == b"[never]"));
-    if !never && !huge_blocks_free() {
-        HUGE.store(false, Ordering::Relaxed);
-    }
+    HUGE.store(false, Ordering::Relaxed);
     SMALLPAGES.store(!HUGE.load(Ordering::Relaxed) || never, Ordering::Relaxed);
-}
-
-// Huge-page faults on a fragmented host stall in direct compaction, so ask for
-// huge pages only when the buddy allocator already holds enough free 2 MiB blocks.
-fn huge_blocks_free() -> bool {
-    const NEED_MB: u64 = 2 << 10;
-    let Ok(s) = std::fs::read_to_string("/proc/buddyinfo") else { return true };
-    let mut mb = 0u64;
-    for l in s.lines() {
-        for (order, n) in l.split_whitespace().skip(4).enumerate().skip(9) {
-            mb += n.parse::<u64>().unwrap_or(0) << (order - 8);
-        }
-    }
-    mb >= NEED_MB
 }
 
 pub unsafe fn release(p: *const u8, bytes: usize) {
