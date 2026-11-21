@@ -1732,27 +1732,33 @@ macro_rules! pipe_stages {
                     continue 'outer;
                 };
                 let mut k1 = $masks(p1).here();
-                loop {
-                    let p2 = k1.next(p1);
-                    let k2 = $masks(p2).here();
-                    _mm_prefetch::<_MM_HINT_T0>($p.wrapping_add(PFD) as *const i8);
-                    let r = $d($cx, $p, st, p1, &mut $w);
-                    $p = r;
-                    if r != p1 {
-                        continue 'outer;
-                    }
-                    if $p > $limrd(&lim) {
-                        break 'outer;
-                    }
-                    let Some(stn) = $s::<$S, false>($cx, $p, k1, $w) else {
-                        let (r, nw) = kcall!($cold::<$S> as unsafe extern "C" fn(_, _, _) -> Pair, $cx as *const _ as u64, $p as u64, $w as u64, 0u64);
-                        $w = nw as *mut i64;
-                        $p = r as *const u8;
-                        continue 'outer;
+                macro_rules! step {
+                    () => {
+                        let p2 = k1.next(p1);
+                        let k2 = $masks(p2).here();
+                        _mm_prefetch::<_MM_HINT_T0>($p.wrapping_add(PFD) as *const i8);
+                        let r = $d($cx, $p, st, p1, &mut $w);
+                        $p = r;
+                        if r != p1 {
+                            continue 'outer;
+                        }
+                        if $p > $limrd(&lim) {
+                            break 'outer;
+                        }
+                        let Some(stn) = $s::<$S, false>($cx, $p, k1, $w) else {
+                            let (r, nw) = kcall!($cold::<$S> as unsafe extern "C" fn(_, _, _) -> Pair, $cx as *const _ as u64, $p as u64, $w as u64, 0u64);
+                            $w = nw as *mut i64;
+                            $p = r as *const u8;
+                            continue 'outer;
+                        };
+                        st = stn;
+                        p1 = p2;
+                        k1 = k2;
                     };
-                    st = stn;
-                    p1 = p2;
-                    k1 = k2;
+                }
+                loop {
+                    step!();
+                    step!();
                 }
             }
         }
