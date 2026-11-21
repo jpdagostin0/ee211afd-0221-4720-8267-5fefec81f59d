@@ -598,7 +598,7 @@ fn credit(sess: &[Sess], cks: &[PC], rs: &mut Vec<u32>, organic: u32, acc: &mut 
             lo += 1;
         }
         let camp = if hi > lo { cks[rs[hi - 1] as usize].camp } else { organic };
-        let a = acc.entry(key(camp, s.day)).or_insert([0; 4]);
+        let a = acc.entry(key(camp, s.day)).or_default();
         a[0] += 1;
         a[1] += s.purch as u64;
         a[2] += s.rev;

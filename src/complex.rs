@@ -96,7 +96,7 @@ pub fn person_shard(g: &G, tid: usize, s: usize, sc: &mut PScratch) {
         if cks.iter().all(|c| c[2] & RAW == 0) {
             dec.clear();
             dec.extend(cks.iter().map(|c| ((c[0] as u128) << 64 | (c[1] >> 32) as u128, !enc36(c[2]).0, *c)));
-            dec.sort_unstable_by(|x, y| (x.0, x.1).cmp(&(y.0, y.1)));
+            dec.sort_unstable_by_key(|x| (x.0, x.1));
             for (d, x) in cks.iter_mut().zip(dec.iter()) {
                 *d = x.2;
             }

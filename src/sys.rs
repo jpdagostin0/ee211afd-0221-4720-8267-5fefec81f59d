@@ -51,7 +51,7 @@ pub fn minflt(who: i32) -> i64 {
 }
 
 pub fn detect_pages() {
-    let never = std::fs::read("/sys/kernel/mm/transparent_hugepage/enabled").map_or(false, |s| s.windows(7).any(|w| w == b"[never]"));
+    let never = std::fs::read("/sys/kernel/mm/transparent_hugepage/enabled").is_ok_and(|s| s.windows(7).any(|w| w == b"[never]"));
     SMALLPAGES.store(!HUGE.load(Ordering::Relaxed) || never, Ordering::Relaxed);
 }
 

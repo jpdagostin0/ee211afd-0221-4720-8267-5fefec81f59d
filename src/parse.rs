@@ -1771,10 +1771,7 @@ mod tests {
 
 #[inline]
 fn next_line_start(data: &[u8], from: usize) -> usize {
-    match data[from..].iter().position(|&b| b == b'\n') {
-        Some(i) => from + i + 1,
-        None => data.len(),
-    }
+    data[from..].iter().position(|&b| b == b'\n').map_or(data.len(), |i| from + i + 1)
 }
 
 struct Drv {

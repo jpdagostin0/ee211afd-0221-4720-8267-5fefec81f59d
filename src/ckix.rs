@@ -64,7 +64,8 @@ pub unsafe fn ck_vec_ix(cb: &CkBatch, pd: &mut Pend, n: usize, p: &CkxP) -> u64 
     let valid = s(VALID);
     let one = s(1);
     let ranged = p.crange.is_some();
-    let (clo, cspan) = (s(p.crange.unwrap_or((0, 0)).0), s(p.crange.unwrap_or((0, 0)).1));
+    let (clo, cspan) = p.crange.unwrap_or_default();
+    let (clo, cspan) = (s(clo), s(cspan));
     let ix_lo = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
     let ix_hi = _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15);
     let nm = if n >= 64 { !0 } else { (1u64 << n) - 1 };

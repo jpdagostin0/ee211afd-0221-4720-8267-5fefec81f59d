@@ -92,10 +92,7 @@ fn class_of(tv: u16, bits: u32) -> u32 {
 #[inline(always)]
 unsafe fn finish_simple(g: &G, t: &mut TState, u: u32, class: u32, st: &crate::core::St) {
     let csr = if crate::parse::SKIP & 4 != 0 { &[][..] } else { g.csr_range(u) };
-    let mut allin = true;
-    for c in csr {
-        allin &= (class >> (c[0] & 15)) & 1 != 0;
-    }
+    let allin = csr.iter().all(|c| (class >> (c[0] & 15)) & 1 != 0);
     if !allin {
         t.ck.clear();
         for c in csr {

@@ -71,11 +71,7 @@ impl Uf {
     fn union(&mut self, a: u32, b: u32) {
         let (ra, rb) = (self.find(a), self.find(b));
         if ra != rb {
-            if ra < rb {
-                self.parent[rb as usize] = ra;
-            } else {
-                self.parent[ra as usize] = rb;
-            }
+            self.parent[ra.max(rb) as usize] = ra.min(rb);
         }
     }
     fn finish(&mut self, g: &G) {

@@ -155,7 +155,7 @@ fn d2(a: u8, b: u8) -> Option<i64> {
 
 pub fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
-    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let era = y.div_euclid(400);
     let yoe = y - era * 400;
     let mp = (m + 9) % 12;
     let doy = (153 * mp + 2) / 5 + d - 1;

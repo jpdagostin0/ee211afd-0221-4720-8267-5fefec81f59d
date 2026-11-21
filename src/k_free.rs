@@ -61,7 +61,7 @@ const fn id_shapes(prefix: u8, dig: usize, chk: usize, allow_empty: bool) -> [Id
             let i = raw * 2 + q;
             let plus = 1 + 2 * q;
             let mut ok = false;
-            if raw >= plus + 1 && raw <= plus + 8 {
+            if raw > plus && raw <= plus + 8 {
                 let nd = raw - plus;
                 let mut j = 8 - nd;
                 while j < 8 {
@@ -172,7 +172,7 @@ const fn dec_shapes(prefix: &[u8]) -> [DecShape; 128] {
         while q < 2 {
             let i = raw * 2 + q;
             let plus = pl + 2 * q;
-            if raw >= plus + 1 && raw <= plus + 8 {
+            if raw > plus && raw <= plus + 8 {
                 let nd = raw - plus;
                 let mut j = 8 - nd;
                 while j < 8 {
@@ -213,7 +213,7 @@ const fn camp4_shapes() -> [DecShape; 128] {
         while q < 2 {
             let i = raw * 2 + (1 - q);
             let plus = pl + 2 * q;
-            if raw >= plus + 1 && raw <= plus + 4 {
+            if raw > plus && raw <= plus + 4 {
                 let nd = raw - plus;
                 let mut j = 4 - nd;
                 while j < 4 {

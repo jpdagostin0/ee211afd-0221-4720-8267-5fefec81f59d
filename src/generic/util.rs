@@ -232,7 +232,7 @@ pub fn map_dir(dir: &Path) -> io::Result<Vec<Mapped>> {
         Ok(rd) => rd
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .filter(|p| p.is_file() && p.file_name().map_or(false, |n| n.as_encoded_bytes().ends_with(b".csv")))
+            .filter(|p| p.is_file() && p.file_name().is_some_and(|n| n.as_encoded_bytes().ends_with(b".csv")))
             .collect(),
         Err(_) => Vec::new(),
     };

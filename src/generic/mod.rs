@@ -214,7 +214,7 @@ fn clear_parquet(dir: &Path) -> io::Result<()> {
     for e in std::fs::read_dir(dir)? {
         let e = e?;
         let p = e.path();
-        if e.file_type()?.is_file() && p.extension().map_or(false, |x| x == "parquet") {
+        if e.file_type()?.is_file() && p.extension().is_some_and(|x| x == "parquet") {
             std::fs::remove_file(&p)?;
         }
     }

@@ -118,7 +118,7 @@ pub trait EventSink {
             *(*b).ing.get_unchecked_mut(i) = r.ingest;
             *(*b).pp.get_unchecked_mut(i) = ev_pp(r.kind, r.product, r.price);
             (*b).n = i + 1;
-            if i + 1 == NB {
+            if (*b).n == NB {
                 self.ev_flush();
             }
         }
@@ -137,7 +137,7 @@ pub trait ClickSink {
             *(*b).ts.get_unchecked_mut(i) = r.ts;
             *(*b).camp.get_unchecked_mut(i) = r.campaign as u64;
             (*b).n = i + 1;
-            if i + 1 == NB {
+            if (*b).n == NB {
                 self.ck_flush();
             }
         }

@@ -489,7 +489,7 @@ impl Core {
         if unsafe { crate::parse::SKIP } & 1 != 0 {
             return;
         }
-        if n == 0 {
+        if cks.is_empty() {
             let base = self.organic * nd;
             for s in &self.sess {
                 let i = base + s.day as usize;

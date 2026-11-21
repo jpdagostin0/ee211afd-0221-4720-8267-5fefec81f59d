@@ -221,7 +221,7 @@ impl Packer {
 fn bits_for(max: u64) -> u32 { (64 - max.leading_zeros()).max(1) }
 fn hybrid_len(n: usize, w: u32) -> usize {
     if n == 0 { return 0; }
-    let g = (n + 7) / 8;
+    let g = n.div_ceil(8);
     varint_len(((g as u64) << 1) | 1) + g * w as usize
 }
 const BLOCK: usize = 8192;

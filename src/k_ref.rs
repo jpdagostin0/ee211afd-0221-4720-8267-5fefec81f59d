@@ -16,10 +16,7 @@ impl Kernel for Ref {
 pub fn for_each_line(buf: &[u8], mut f: impl FnMut(usize, usize)) {
     let mut start = 0;
     while start < buf.len() {
-        let end = match buf[start..].iter().position(|&b| b == b'\n') {
-            Some(p) => start + p,
-            None => buf.len(),
-        };
+        let end = buf[start..].iter().position(|&b| b == b'\n').map_or(buf.len(), |p| start + p);
         f(start, end);
         start = end + 1;
     }

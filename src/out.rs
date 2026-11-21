@@ -505,12 +505,11 @@ pub fn stage45(g: &mut G, outdir: &str) {
     let order = crate::complex::shard_order(g);
     g.next.store(0, Ordering::Relaxed);
     let gr: &G = g;
-    let gr_nc_plus1 = |g: &G| g.nc + 1;
     let (ca_done, sh_next, sh_done, pq, fq) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
     let (ns, np) = (order.len(), pieces3.len());
     let nf = 2 * nt;
     let csum: Vec<std::sync::Mutex<[i64; 4]>> = (0..nt).map(|_| std::sync::Mutex::new([0; 4])).collect();
-    let ncp = gr_nc_plus1(g);
+    let ncp = gr.nc + 1;
     let rg_len = gr.files.last().map_or(0, |f| f.off + f.len);
     let rg_todo = AtomicBool::new(REGION_UNMAP.load(Ordering::Relaxed) && rg_len > 0 && !gr.region.is_null());
     run_par(nt, |tid| {

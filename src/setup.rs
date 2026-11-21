@@ -166,7 +166,7 @@ fn lookups(data: &Path) -> Lookups {
             break;
         }
     }
-    let names: Vec<&[u8]> = nm.iter().map(|v| v.as_slice()).collect();
+    let names: Vec<&[u8]> = nm.iter().map(Vec::as_slice).collect();
     if bad {
         fallback("products.csv is not canonical, or has too many categories");
     }

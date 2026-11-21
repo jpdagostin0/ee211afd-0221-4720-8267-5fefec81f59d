@@ -419,7 +419,7 @@ fn user_zero_rows(xs: impl Iterator<Item = (u64, Option<u64>)>, user_key: u64) -
 
 fn probes(distinct: &[u64], not: u64) -> Option<(u64, u64)> {
     let mut it = distinct.iter().copied().filter(|&x| x != not);
-    Some((it.next()?, it.last()?))
+    Some((it.next()?, it.next_back()?))
 }
 
 pub fn recover_event_key(s: &Sample, user_key: u64, window_start: Option<i64>, st: &mut Stats) -> Option<u64> {
