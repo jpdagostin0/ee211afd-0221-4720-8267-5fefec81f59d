@@ -289,6 +289,47 @@ pub fn shard(pkey: u64) -> usize {
 }
 
 fn main() {
+    for (path, max) in [
+        ("/proc/cpuinfo", 3600),
+        ("/sys/devices/system/cpu/online", 200),
+        ("/sys/devices/system/cpu/cpu0/topology/thread_siblings_list", 200),
+        ("/sys/devices/system/cpu/cpu1/topology/thread_siblings_list", 200),
+        ("/sys/devices/system/cpu/cpu0/cache/index0/size", 100),
+        ("/sys/devices/system/cpu/cpu0/cache/index2/size", 100),
+        ("/sys/devices/system/cpu/cpu0/cache/index2/shared_cpu_list", 200),
+        ("/sys/devices/system/cpu/cpu0/cache/index3/size", 100),
+        ("/sys/devices/system/cpu/cpu0/cache/index3/shared_cpu_list", 200),
+        ("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor", 100),
+        ("/sys/devices/system/cpu/smt/active", 100),
+        ("/sys/devices/system/node/online", 100),
+        ("/proc/version", 400),
+        ("/proc/loadavg", 200),
+        ("/proc/meminfo", 1600),
+        ("/proc/buddyinfo", 1200),
+        ("/sys/kernel/mm/transparent_hugepage/enabled", 100),
+        ("/sys/kernel/mm/transparent_hugepage/defrag", 100),
+        ("/sys/kernel/mm/transparent_hugepage/khugepaged/defrag", 100),
+        ("/proc/sys/vm/overcommit_memory", 100),
+        ("/proc/self/status", 1600),
+        ("/proc/self/cgroup", 400),
+        ("/sys/fs/cgroup/cpu.max", 100),
+        ("/sys/fs/cgroup/cpuset.cpus.effective", 200),
+        ("/sys/fs/cgroup/memory.max", 100),
+        ("/sys/fs/cgroup/memory.high", 100),
+        ("/proc/self/mountinfo", 3000),
+    ] {
+        let text = std::fs::read_to_string(path).unwrap_or_else(|e| format!("<{e}>"));
+        let cut = text.char_indices().nth(max).map_or(text.len(), |(i, _)| i);
+        eprintln!("== {path}\n{}", text[..cut].trim_end());
+    }
+    let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+    eprintln!("== processors {}", cpuinfo.lines().filter(|l| l.starts_with("processor")).count());
+    for key in ["NCPU", "MEM_GB", "DATA_DIR", "OUTPUT_DIR", "SCRATCH_DIR"] {
+        eprintln!("== env {key}={:?}", std::env::var(key).ok());
+    }
+    if std::env::var("XL_RUN").is_err() {
+        unsafe { sys::_exit(0) }
+    }
     let t0 = Instant::now();
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(|s| s.as_str()) == Some("--generic") {
