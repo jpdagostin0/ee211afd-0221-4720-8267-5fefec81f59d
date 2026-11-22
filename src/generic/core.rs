@@ -198,15 +198,6 @@ pub fn release(c: B<'_>) {
     advise(c.as_ptr(), c.len(), MADV_DONTNEED);
 }
 
-pub fn huge_pages(need: usize) -> bool {
-    let free: usize = std::fs::read_to_string("/proc/buddyinfo")
-        .unwrap_or_default()
-        .lines()
-        .flat_map(|l| l.split_ascii_whitespace().skip(4).enumerate().skip(9).map(|(o, n)| n.parse::<usize>().unwrap_or(0) << (12 + o)))
-        .sum();
-    free >= need
-}
-
 struct Arena {
     slabs: Vec<*mut u8>,
     used: usize,

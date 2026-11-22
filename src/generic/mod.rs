@@ -90,7 +90,7 @@ pub fn run(data_dir: &Path, out_dir: &Path, ncpu: usize) -> io::Result<()> {
     }
     let ev_bytes: usize = ev_files.iter().map(|f| f.len()).sum();
     let nshard = (ev_bytes / SHARD_BYTES).next_power_of_two().min(4096);
-    let huge = huge_pages(ev_bytes);
+    let huge = true;
     lap("setup");
 
     let ectx = EvCtx { lo, ws, we, products, unknown_cat };
