@@ -41,75 +41,6 @@ pub fn count_lines(c: B) -> usize {
     count_byte(c, b'\n')
 }
 
-#[inline]
-pub fn for_lines<'a>(chunk: B<'a>, mut f: impl FnMut(B<'a>)) {
-    let n = chunk.len();
-    let mut s = 0usize;
-    let mut base = 0usize;
-    while base + 64 <= n {
-        let mut m = eq_mask64(&chunk[base..], b'\n');
-        while m != 0 {
-            let p = base + m.trailing_zeros() as usize;
-            if p > s {
-                f(&chunk[s..p]);
-            }
-            s = p + 1;
-            m &= m - 1;
-        }
-        base += 64;
-    }
-    for p in base..n {
-        if chunk[p] == b'\n' {
-            if p > s {
-                f(&chunk[s..p]);
-            }
-            s = p + 1;
-        }
-    }
-    if s < n {
-        f(&chunk[s..]);
-    }
-}
-
-#[inline]
-fn unquote(f: B, has_quote: bool) -> Option<B> {
-    if !has_quote {
-        return Some(f);
-    }
-    let n = f.len();
-    if n >= 2 && f[0] == b'"' && f[n - 1] == b'"' && !f[1..n - 1].contains(&b'"') {
-        Some(&f[1..n - 1])
-    } else {
-        None
-    }
-}
-
-#[inline]
-pub fn split<'a, const N: usize>(line: B<'a>) -> Option<[B<'a>; N]> {
-    let mut out: [B<'a>; N] = [&[]; N];
-    let mut k = 0usize;
-    let mut start = 0usize;
-    let mut q = false;
-    for (i, &b) in line.iter().enumerate() {
-        if b == b',' {
-            if k + 1 >= N {
-                return None;
-            }
-            out[k] = unquote(&line[start..i], q)?;
-            k += 1;
-            start = i + 1;
-            q = false;
-        } else if b == b'"' {
-            q = true;
-        }
-    }
-    if k + 1 != N {
-        return None;
-    }
-    out[k] = unquote(&line[start..], q)?;
-    Some(out)
-}
-
 const ROW_BUF: usize = 256;
 
 #[inline]
@@ -534,17 +465,6 @@ mod tests {
         out
     }
 
-    fn split_rows<const N: usize>(chunk: &[u8]) -> Vec<(usize, [(usize, usize); N])> {
-        let at = |p: *const u8| -> usize { p as usize - chunk.as_ptr() as usize };
-        let mut out = Vec::new();
-        for_lines(chunk, |l| {
-            if let Some(fields) = split::<N>(l) {
-                out.push((at(l.as_ptr()), fields.map(|f| (at(f.as_ptr()), f.len()))));
-            }
-        });
-        out
-    }
-
     struct Rng(u64);
     impl Rng {
         fn next(&mut self) -> u64 {
@@ -567,8 +487,6 @@ mod tests {
         assert_eq!(new_rows::<4>(chunk), old_rows::<4>(chunk), "{:?}", String::from_utf8_lossy(chunk));
         assert_eq!(new_rows::<7>(chunk), old_rows::<7>(chunk), "{:?}", String::from_utf8_lossy(chunk));
         assert_eq!(new_rows::<8>(chunk), old_rows::<8>(chunk), "{:?}", String::from_utf8_lossy(chunk));
-        assert_eq!(split_rows::<2>(chunk), old_rows::<2>(chunk), "{:?}", String::from_utf8_lossy(chunk));
-        assert_eq!(split_rows::<7>(chunk), old_rows::<7>(chunk), "{:?}", String::from_utf8_lossy(chunk));
     }
 
     fn random_line(r: &mut Rng, out: &mut Vec<u8>) {
@@ -757,10 +675,6 @@ mod tests {
         assert_eq!(parse_price(b"10000000"), Some(10_000_000));
         assert_eq!(parse_price(b"10000001"), None);
         assert_eq!(parse_price(b"0"), None);
-        assert_eq!(split::<2>(b"\"a\",\"\""), Some([&b"a"[..], &b""[..]]));
-        assert_eq!(split::<2>(b"a,b\""), None);
-        assert_eq!(split::<2>(b"a,b,c"), None);
-        assert_eq!(split::<2>(b"a"), None);
         let l = b"\"e1\",u 1,x,y";
         assert_eq!(unsafe { first(&l[0]) }, &b"e1"[..]);
         let l = b",\"\",x";
@@ -776,10 +690,6 @@ mod tests {
             }
         }
         s.extend_from_slice(b"tail");
-        let mut got = Vec::new();
-        for_lines(&s, |l| got.push(l.to_vec()));
-        assert_eq!(got.len(), 301);
-        assert_eq!(got[300], b"tail".to_vec());
         assert_eq!(count_lines(&s), 300 + 2 * 43);
         assert_eq!(find_byte(&s[1..], b'\n'), Some(4));
     }

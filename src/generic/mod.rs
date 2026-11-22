@@ -4,8 +4,8 @@ use crate::pqw;
 mod util;
 
 use self::core::*;
-use self::parse::{chunk_target, chunks, for_lines, split, B};
-use self::util::{map_dir, new_map, par_run, Map, Mapped};
+use self::parse::{chunk_target, chunks, for_rows, B};
+use self::util::{map_dir, par_run, Mapped};
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -39,37 +39,38 @@ pub fn run(data_dir: &Path, out_dir: &Path, ncpu: usize) -> io::Result<()> {
 
     let mut prod_rows: Vec<(B, B)> = Vec::new();
     for c in chunks(&[prodm.bytes()], usize::MAX / 2) {
-        for_lines(c, |l| {
-            if let Some([p, cat]) = split::<2>(l) {
-                prod_rows.push((p, cat));
+        for_rows(c, |_, [p, cat]: [B; 2]| prod_rows.push((p, cat)));
+    }
+    let mut cats = Names::new(0);
+    let mut cat_first: Vec<B> = vec![b"unknown"];
+    cats.insert(b"unknown", 0);
+    let cat_of: Vec<u32> = prod_rows
+        .iter()
+        .map(|&(_, c)| {
+            let id = cats.insert(c, cat_first.len() as u32);
+            if id as usize == cat_first.len() {
+                cat_first.push(c);
             }
-        });
-    }
-    let mut cat_names: Vec<B> = prod_rows.iter().map(|r| r.1).collect();
-    cat_names.push(b"unknown");
+            id
+        })
+        .collect();
+    let mut cat_names = cat_first.clone();
     cat_names.sort_unstable();
-    cat_names.dedup();
-    let mut cat_rank: Map<B, u32> = new_map(cat_names.len());
-    for (i, &c) in cat_names.iter().enumerate() {
-        cat_rank.insert(c, i as u32);
+    let rank: Vec<u32> = cat_first.iter().map(|c| cat_names.binary_search(c).unwrap() as u32).collect();
+    let mut products = Names::new(prod_rows.len());
+    for (&(p, _), &c) in prod_rows.iter().zip(&cat_of) {
+        products.insert(p, rank[c as usize]);
     }
-    let mut products: Map<B, u32> = new_map(prod_rows.len());
-    for &(p, c) in &prod_rows {
-        products.entry(p).or_insert(cat_rank[c]);
-    }
-    let unknown_cat = cat_rank[&b"unknown"[..]];
+    let unknown_cat = rank[0];
     drop(prod_rows);
     let mut camp_ids: Vec<B> = Vec::new();
     let mut channels: Vec<B> = Vec::new();
-    let mut campaigns: Map<B, u32> = new_map(1024);
+    let mut campaigns = Names::new(0);
     for c in chunks(&[campm.bytes()], usize::MAX / 2) {
-        for_lines(c, |l| {
-            if let Some([id, ch]) = split::<2>(l) {
-                if !campaigns.contains_key(id) {
-                    campaigns.insert(id, camp_ids.len() as u32);
-                    camp_ids.push(id);
-                    channels.push(ch);
-                }
+        for_rows(c, |_, [id, ch]: [B; 2]| {
+            if campaigns.insert(id, camp_ids.len() as u32) as usize == camp_ids.len() {
+                camp_ids.push(id);
+                channels.push(ch);
             }
         });
     }
@@ -92,7 +93,7 @@ pub fn run(data_dir: &Path, out_dir: &Path, ncpu: usize) -> io::Result<()> {
     let huge = huge_pages(ev_bytes);
     lap("setup");
 
-    let ectx = EvCtx { lo, ws, we, products: &products, unknown_cat };
+    let ectx = EvCtx { lo, ws, we, products, unknown_cat };
     let (nl, ne, nc) = (lk_chunks.len(), ev_chunks.len(), ck_chunks.len());
     let lk_parts: Vec<Mutex<LinkPart>> = (0..nl).map(|_| Mutex::new(Vec::new())).collect();
     let lk_done = AtomicUsize::new(0);
@@ -118,7 +119,7 @@ pub fn run(data_dir: &Path, out_dir: &Path, ncpu: usize) -> io::Result<()> {
     drop(lk_parts);
     lap("parse+links");
 
-    let cctx = CkCtx { lo, we, campaigns: &campaigns, links: &links };
+    let cctx = CkCtx { lo, we, campaigns, links: &links };
     let (_, mut routed) = par_run(nshard + nc, ncpu, || Routed::new(nshard, huge), |st, i| {
         if i < nshard {
             dedup_route(&parsed, i, &links, nshard, st);

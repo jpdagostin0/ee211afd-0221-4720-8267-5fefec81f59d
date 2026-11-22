@@ -44,10 +44,17 @@ fn fingerprint(b: &[u8]) -> [u64; 2] {
     [mix(x ^ C[6], C[7]), mix(y ^ C[7], C[6])]
 }
 
-#[inline]
+#[inline(always)]
 fn key_of(b: &[u8]) -> (u8, [u64; 2]) {
     let n = b.len();
     if n <= 15 {
+        if n > 0 && b.as_ptr() as usize & 4095 <= 4080 {
+            unsafe {
+                let keep = _mm_cmpgt_epi8(_mm_set1_epi8(n as i8), _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15));
+                let v = _mm_insert_epi8::<15>(_mm_and_si128(_mm_loadu_si128(b.as_ptr() as *const __m128i), keep), n as i32);
+                return (T_SHORT, [_mm_cvtsi128_si64(v) as u64, _mm_extract_epi64::<1>(v) as u64]);
+            }
+        }
         let (lo, hi) = if n >= 8 {
             (r64(b, 0), if n > 8 { r64(b, n - 8) >> (8 * (16 - n)) } else { 0 })
         } else if n >= 4 {
@@ -88,6 +95,68 @@ fn hex32(b: &[u8; 32]) -> Option<[u64; 2]> {
 #[inline]
 fn khash(tag: u8, k: [u64; 2]) -> u64 {
     mix(mix(k[0] ^ C[0], k[1] ^ C[1] ^ tag as u64) ^ C[2], C[3])
+}
+
+pub struct Names<'a> {
+    slots: Vec<([u64; 2], u32)>,
+    len: usize,
+    long: Map<B<'a>, u32>,
+}
+
+impl<'a> Names<'a> {
+    pub fn new(n: usize) -> Self {
+        Names { slots: vec![([0; 2], u32::MAX); (2 * n).next_power_of_two().max(16)], len: 0, long: new_map(0) }
+    }
+    pub fn insert(&mut self, b: B<'a>, v: u32) -> u32 {
+        if b.len() > 15 {
+            return *self.long.entry(b).or_insert(v);
+        }
+        let k = key_of(b).1;
+        let mask = self.slots.len() - 1;
+        let mut i = khash(T_SHORT, k) as usize & mask;
+        loop {
+            let s = &mut self.slots[i];
+            if s.1 == u32::MAX {
+                *s = (k, v);
+                self.len += 1;
+                if 2 * self.len > self.slots.len() {
+                    let old = std::mem::replace(&mut self.slots, vec![([0; 2], u32::MAX); 2 * (mask + 1)]);
+                    let mask = 2 * mask + 1;
+                    for (k, v) in old.into_iter().filter(|s| s.1 != u32::MAX) {
+                        let mut i = khash(T_SHORT, k) as usize & mask;
+                        while self.slots[i].1 != u32::MAX {
+                            i = (i + 1) & mask;
+                        }
+                        self.slots[i] = (k, v);
+                    }
+                }
+                return v;
+            }
+            if s.0 == k {
+                return s.1;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+    #[inline]
+    fn get(&self, b: B<'_>) -> Option<u32> {
+        if b.len() > 15 {
+            return self.long.get(b).copied();
+        }
+        let k = key_of(b).1;
+        let mask = self.slots.len() - 1;
+        let mut i = khash(T_SHORT, k) as usize & mask;
+        loop {
+            let s = &self.slots[i];
+            if s.1 == u32::MAX {
+                return None;
+            }
+            if s.0 == k {
+                return Some(s.1);
+            }
+            i = (i + 1) & mask;
+        }
+    }
 }
 
 #[inline]
@@ -269,9 +338,6 @@ impl<T: Copy> Bins<T> {
         let last = self.len(s) - b.len().saturating_sub(1) * Self::PER;
         b.iter().enumerate().map(move |(j, &p)| unsafe { std::slice::from_raw_parts(p, if j + 1 == b.len() { last } else { Self::PER }) })
     }
-    fn get(&self, s: usize, i: usize) -> &T {
-        unsafe { &*self.list(s)[i / Self::PER].add(i % Self::PER) }
-    }
 }
 
 #[derive(Default)]
@@ -290,10 +356,14 @@ impl Tab32 {
         self.slots.resize(slots, 0);
     }
     #[inline]
-    fn find(&self, h: u64, mut eq: impl FnMut(u32) -> bool) -> Result<(usize, u32), usize> {
+    fn find(&self, h: u64, eq: impl FnMut(u32) -> bool) -> Result<(usize, u32), usize> {
+        self.find_from(h, h as usize, eq)
+    }
+    #[inline]
+    fn find_from(&self, h: u64, from: usize, mut eq: impl FnMut(u32) -> bool) -> Result<(usize, u32), usize> {
         let mask = self.slots.len() - 1;
         let tag = ((h >> 32) << self.bits) as u32;
-        let mut i = h as usize & mask;
+        let mut i = from & mask;
         loop {
             let s = self.slots[i];
             if s == 0 {
@@ -311,6 +381,10 @@ impl Tab32 {
     #[inline]
     fn set(&mut self, slot: usize, h: u64, idx: u32) {
         self.slots[slot] = ((h >> 32) << self.bits) as u32 | (idx + 1);
+    }
+    #[inline]
+    fn held(&self, slot: usize) -> u32 {
+        (self.slots[slot] & ((1 << self.bits) - 1)) - 1
     }
 }
 
@@ -433,17 +507,19 @@ pub fn build_links<'a>(parts: &[LinkPart<'a>], huge: bool) -> LinkMap<'a> {
             }
         }
     }
-    let m = ids.len();
-    let mut min_of: Vec<u32> = (0..m as u32).collect();
-    for i in 0..m as u32 {
-        let r = find(&mut parent, i) as usize;
-        if ids[i as usize] < ids[min_of[r] as usize] {
-            min_of[r] = i;
+    for i in 0..parent.len() {
+        parent[i] = parent[parent[i] as usize];
+    }
+    let mut min_of: Vec<u32> = (0..ids.len() as u32).collect();
+    for (i, &r) in parent.iter().enumerate() {
+        if ids[i] < ids[min_of[r as usize] as usize] {
+            min_of[r as usize] = i as u32;
         }
     }
+    let canon: Vec<u32> = parent.iter().map(|&r| min_of[r as usize] + 1).collect();
     for s in &mut slots {
         if s.name != 0 {
-            s.name = min_of[parent[s.name as usize - 1] as usize] + 1;
+            s.name = canon[s.name as usize - 1];
         }
     }
     LinkMap { slots, ids }
@@ -503,15 +579,15 @@ impl Parsed {
     }
 }
 
-pub struct EvCtx<'m, 'a> {
+pub struct EvCtx<'a> {
     pub lo: i64,
     pub ws: i64,
     pub we: i64,
-    pub products: &'m Map<B<'a>, u32>,
+    pub products: Names<'a>,
     pub unknown_cat: u32,
 }
 
-pub fn parse_events(c: B<'_>, chunk: u16, ctx: &EvCtx<'_, '_>, out: &mut Parsed) {
+pub fn parse_events(c: B<'_>, chunk: u16, ctx: &EvCtx<'_>, out: &mut Parsed) {
     let nshard = out.side.len();
     for_rows(c, |_, [eid, user, ts, ingest, typ, product, price]: [B; 7]| {
         if eid.is_empty() {
@@ -538,7 +614,7 @@ pub fn parse_events(c: B<'_>, chunk: u16, ctx: &EvCtx<'_, '_>, out: &mut Parsed)
             if ty == T_PURCHASE {
                 let Some(p) = parse_price(price) else { break 'v };
                 pr = p;
-                e.cat = *ctx.products.get(product).unwrap_or(&ctx.unknown_cat);
+                e.cat = ctx.products.get(product).unwrap_or(ctx.unknown_cat);
             }
             if ingest - t > DAY_MS {
                 break 'v;
@@ -559,12 +635,24 @@ pub fn parse_events(c: B<'_>, chunk: u16, ctx: &EvCtx<'_, '_>, out: &mut Parsed)
     unsafe { _mm_sfence() };
 }
 
+#[derive(Clone, Copy)]
+struct Hit {
+    eid: [u64; 2],
+    ingest: i64,
+    h: u64,
+    slot: u32,
+    idx: u32,
+    chunk: u16,
+    etag: u8,
+}
+
 pub struct Routed<'a> {
     arena: Arena,
     rec: Bins<Rec>,
     ck: Bins<Ck<'a>>,
     tab: Tab32,
-    lose: Vec<u32>,
+    hits: Vec<Hit>,
+    sel: Vec<Rec>,
     pend: Vec<Ck<'a>>,
 }
 impl Routed<'_> {
@@ -576,84 +664,82 @@ impl Routed<'_> {
         self.arena.release();
     }
     pub fn new(nshard: usize, huge: bool) -> Self {
-        Routed { arena: Arena::new(huge), rec: Bins::new(nshard), ck: Bins::new(nshard), tab: Tab32::default(), lose: Vec::new(), pend: Vec::with_capacity(BATCH) }
+        Routed { arena: Arena::new(huge), rec: Bins::new(nshard), ck: Bins::new(nshard), tab: Tab32::default(), hits: Vec::new(), sel: Vec::new(), pend: Vec::with_capacity(BATCH) }
     }
 }
 
 const BATCH: usize = 32;
 
 pub fn dedup_route(parsed: &[Parsed], s: usize, links: &LinkMap<'_>, nshard: usize, out: &mut Routed<'_>) {
+    let per = Bins::<Ev>::PER;
+    let blk: Vec<*mut Ev> = parsed.iter().flat_map(|p| p.ev.list(s).iter().copied()).collect();
+    let at = |i: u32| unsafe { blk[i as usize / per].add(i as usize % per) };
     let total: usize = parsed.iter().map(|p| p.ev.len(s)).sum();
-    let at = |mut i: usize| -> &Ev {
-        for p in parsed {
-            let n = p.ev.len(s);
-            if i < n {
-                return p.ev.get(s, i);
-            }
-            i -= n;
-        }
-        unreachable!()
-    };
-    out.tab.reset(total, 2 * total);
-    out.lose.clear();
-    let mut flat = 0u32;
-    for p in parsed {
-        for blk in p.ev.blocks(s) {
-            for e in blk {
-                let h = khash(e.etag, e.eid);
-                match out.tab.find(h, |i| {
-                    let o = at(i as usize);
-                    o.eid == e.eid && o.etag == e.etag
-                }) {
-                    Ok((slot, i)) => {
-                        let o = at(i as usize);
-                        if e.ingest < o.ingest || (e.ingest == o.ingest && e.chunk < o.chunk) {
-                            out.lose.push(i);
-                            out.tab.set(slot, h, flat);
-                        } else {
-                            out.lose.push(flat);
-                        }
-                    }
-                    Err(slot) => out.tab.set(slot, h, flat),
-                }
-                flat += 1;
-            }
-        }
-    }
-    out.lose.sort_unstable();
+    out.tab.reset(blk.len() * per, 2 * total);
+    out.hits.clear();
+    out.sel.clear();
     let mut hs = [0u64; BATCH];
-    let mut flat = 0u32;
-    let mut li = 0usize;
+    let mut first = 0;
     for p in parsed {
-        for blk in p.ev.blocks(s) {
-            for sub in blk.chunks(BATCH) {
-                let mut keep = 0u32;
+        for b in p.ev.blocks(s) {
+            for (c, sub) in b.chunks(BATCH).enumerate() {
                 for (i, e) in sub.iter().enumerate() {
-                    flat += 1;
-                    if li < out.lose.len() && out.lose[li] == flat - 1 {
-                        li += 1;
-                        continue;
-                    }
-                    if (e.pt >> 24) > T_PURCHASE {
-                        continue;
-                    }
-                    hs[i] = khash(e.utag, e.user);
-                    links.prefetch(hs[i]);
-                    keep |= 1 << i;
+                    hs[i] = khash(e.etag, e.eid);
+                    prefetch(&out.tab.slots[hs[i] as usize & (out.tab.slots.len() - 1)]);
+                    out.sel.push(Rec { k: e.user, ts: e.ts, pt: e.pt, cat: e.cat, tag: e.utag });
                 }
-                while keep != 0 {
-                    let i = keep.trailing_zeros() as usize;
-                    keep &= keep - 1;
-                    let e = &sub[i];
-                    let (tag, k) = links.person(e.utag, e.user, hs[i]);
-                    let h = if tag == T_LINK { khash(tag, k) } else { hs[i] };
-                    out.rec.push(&mut out.arena, shard_of(h, nshard), Rec { k, ts: e.ts, pt: e.pt, cat: e.cat, tag });
+                for (i, (e, &h)) in sub.iter().zip(&hs).enumerate() {
+                    let idx = (first + c * BATCH + i) as u32;
+                    match out.tab.find(h, |_| true) {
+                        Ok((slot, _)) => out.hits.push(Hit { eid: e.eid, ingest: e.ingest, h, slot: slot as u32, idx, chunk: e.chunk, etag: e.etag }),
+                        Err(slot) => out.tab.set(slot, h, idx),
+                    }
                 }
             }
+            first += per;
+            out.sel.resize(first, Rec { k: [0; 2], ts: 0, pt: T_INVALID << 24, cat: 0, tag: 0 });
         }
     }
-    for p in parsed {
-        out.arena.pool.extend(p.ev.list(s).iter().map(|&b| b as *mut u8));
+    for j in 0..out.hits.len() {
+        if let Some(n) = out.hits.get(j + 16) {
+            let o = at(out.tab.held(n.slot as usize));
+            prefetch(unsafe { &*o });
+            prefetch(unsafe { &(*o).chunk });
+        }
+        let x = out.hits[j];
+        match out.tab.find_from(x.h, x.slot as usize, |i| unsafe { (*at(i)).eid == x.eid && (*at(i)).etag == x.etag }) {
+            Ok((slot, cur)) => {
+                let o = at(cur);
+                let lose = if (x.ingest, x.chunk, x.idx) < unsafe { ((*o).ingest, (*o).chunk, cur) } {
+                    out.tab.set(slot, x.h, x.idx);
+                    cur
+                } else {
+                    x.idx
+                };
+                out.sel[lose as usize].pt = T_INVALID << 24;
+            }
+            Err(slot) => out.tab.set(slot, x.h, x.idx),
+        }
+    }
+    out.arena.pool.extend(blk.iter().map(|&b| b as *mut u8));
+    for sub in out.sel.chunks(BATCH) {
+        let mut keep = 0u32;
+        for (i, r) in sub.iter().enumerate() {
+            if (r.pt >> 24) > T_PURCHASE {
+                continue;
+            }
+            hs[i] = khash(r.tag, r.k);
+            links.prefetch(hs[i]);
+            keep |= 1 << i;
+        }
+        while keep != 0 {
+            let i = keep.trailing_zeros() as usize;
+            keep &= keep - 1;
+            let r = &sub[i];
+            let (tag, k) = links.person(r.tag, r.k, hs[i]);
+            let h = if tag == T_LINK { khash(tag, k) } else { hs[i] };
+            out.rec.push(&mut out.arena, shard_of(h, nshard), Rec { k, tag, ..*r });
+        }
     }
     unsafe { _mm_sfence() };
 }
@@ -661,7 +747,7 @@ pub fn dedup_route(parsed: &[Parsed], s: usize, links: &LinkMap<'_>, nshard: usi
 pub struct CkCtx<'m, 'a> {
     pub lo: i64,
     pub we: i64,
-    pub campaigns: &'m Map<B<'a>, u32>,
+    pub campaigns: Names<'a>,
     pub links: &'m LinkMap<'a>,
 }
 
@@ -675,7 +761,7 @@ pub fn parse_clicks<'a>(c: B<'a>, ctx: &CkCtx<'_, '_>, nshard: usize, out: &mut 
         if t < ctx.lo || t >= ctx.we {
             return;
         }
-        let Some(&camp) = ctx.campaigns.get(camp) else { return };
+        let Some(camp) = ctx.campaigns.get(camp) else { return };
         let (tag, k) = key_of(user);
         pend.push(Ck { k, line, ts: (t - ctx.lo) as u32, camp, tag });
         if pend.len() == BATCH {
@@ -748,7 +834,7 @@ struct Scratch {
     day_end: Vec<u32>,
     catsum: Vec<u64>,
     touched: Vec<u32>,
-    ct: Vec<(u32, i64)>,
+    ct: Vec<u64>,
 }
 
 struct DayAcc {
@@ -793,8 +879,7 @@ struct PersonCtx<'s, 'a> {
     organic: u32,
 }
 
-fn person(pid: u32, evs: &mut [u64], cks: &mut [u64], cx: &PersonCtx<'_, '_>, sc: &mut Scratch, rows: &mut Rows, acc: &mut Acc) {
-    evs.sort_unstable();
+fn person(pid: u32, evs: &[u64], cks: &[u64], cx: &PersonCtx<'_, '_>, sc: &mut Scratch, rows: &mut Rows, acc: &mut Acc) {
     sc.sess.clear();
     let mut d = DayAcc { day: 0, sessions: 0, events: 0, revenue: 0 };
     let mut prev = 0i64;
@@ -828,7 +913,6 @@ fn person(pid: u32, evs: &mut [u64], cks: &mut [u64], cx: &PersonCtx<'_, '_>, sc
     }
     flush_row(pid, &d, sc, rows);
 
-    cks.sort_unstable();
     credit(&sc.sess, cks, cx, acc);
     if !cks.is_empty() {
         sc.starts.clear();
@@ -846,7 +930,7 @@ fn person(pid: u32, evs: &mut [u64], cks: &mut [u64], cx: &PersonCtx<'_, '_>, sc
             sc.day_end[i] = end;
         }
         sc.ct.clear();
-        sc.ct.extend(cks.iter().map(|&c| (cx.cl[c as u32 as usize].0, (c >> 32) as i64)));
+        sc.ct.extend(cks.iter().map(|&c| (cx.cl[c as u32 as usize].0 as u64) << 32 | c >> 32));
         sc.ct.sort_unstable();
         assists(&sc.starts, &sc.days, &sc.day_end, &sc.ct, acc);
     }
@@ -856,7 +940,8 @@ fn person(pid: u32, evs: &mut [u64], cks: &mut [u64], cx: &PersonCtx<'_, '_>, sc
 struct ShardBufs<'a> {
     tab: Tab32,
     keys: Vec<(u8, [u64; 2])>,
-    tmp: Vec<(u32, u64)>,
+    tmp: Vec<[u32; 3]>,
+    tmp2: Vec<[u32; 3]>,
     off: Vec<u32>,
     pos: Vec<u32>,
     pe: Vec<u64>,
@@ -887,7 +972,35 @@ impl Worker<'_> {
     }
 }
 
-fn group(tmp: &[(u32, u64)], off: &mut [u32], pos: &mut Vec<u32>, out: &mut Vec<u64>) {
+fn sort_ts(a: &mut Vec<[u32; 3]>, b: &mut Vec<[u32; 3]>) {
+    let mut cnt = [[0u32; 2048]; 3];
+    for x in a.iter() {
+        let t = x[1] as usize;
+        cnt[0][t & 2047] += 1;
+        cnt[1][(t >> 11) & 2047] += 1;
+        cnt[2][t >> 22] += 1;
+    }
+    b.clear();
+    if b.capacity() < a.len() {
+        extend(b, a.capacity());
+    }
+    for (d, c) in cnt.iter_mut().enumerate() {
+        let mut sum = 0;
+        for x in c.iter_mut() {
+            (*x, sum) = (sum, sum + *x);
+        }
+        let dst = b.as_mut_ptr();
+        for &x in a.iter() {
+            let q = &mut c[((x[1] >> (11 * d)) & 2047) as usize];
+            unsafe { dst.add(*q as usize).write(x) };
+            *q += 1;
+        }
+        unsafe { b.set_len(a.len()) };
+        std::mem::swap(a, b);
+    }
+}
+
+fn group(tmp: &[[u32; 3]], off: &mut [u32], pos: &mut Vec<u32>, out: &mut Vec<u64>) {
     let np = off.len() - 1;
     for i in 0..np {
         off[i + 1] += off[i];
@@ -896,9 +1009,9 @@ fn group(tmp: &[(u32, u64)], off: &mut [u32], pos: &mut Vec<u32>, out: &mut Vec<
     pos.extend_from_slice(&off[..np]);
     out.clear();
     out.resize(tmp.len(), 0);
-    for &(pid, k) in tmp {
+    for &[pid, ts, low] in tmp {
         let q = &mut pos[pid as usize];
-        out[*q as usize] = k;
+        out[*q as usize] = (ts as u64) << 32 | low as u64;
         *q += 1;
     }
 }
@@ -941,21 +1054,17 @@ pub fn run_shard<'a>(routed: &[Routed<'a>], parsed: &[Parsed], links: &LinkMap<'
                     }
                 };
                 bf.off[pid as usize + 1] += 1;
-                let mut k = (e.ts as u64) << 32;
+                let mut low = 0;
                 if e.pt >> 24 == T_PURCHASE {
                     bf.purch.push((e.pt & 0x00ff_ffff, e.cat));
-                    k |= bf.purch.len() as u64;
+                    low = bf.purch.len() as u32;
                 }
-                bf.tmp.push((pid, k));
+                bf.tmp.push([pid, e.ts, low]);
             }
         }
     }
     let np = bf.keys.len();
-    for &(tag, k) in &bf.keys {
-        if tag == T_LINK {
-            prefetch(&links.ids[k[0] as usize][0]);
-        }
-    }
+    sort_ts(&mut bf.tmp, &mut bf.tmp2);
     group(&bf.tmp, &mut bf.off, &mut bf.pos, &mut bf.pe);
     bf.tmp.clear();
     bf.cl.clear();
@@ -966,16 +1075,20 @@ pub fn run_shard<'a>(routed: &[Routed<'a>], parsed: &[Parsed], links: &LinkMap<'
             for c in blk {
                 if let Ok((_, pid)) = bf.tab.find(khash(c.tag, c.k), |i| bf.keys[i as usize] == (c.tag, c.k)) {
                     bf.coff[pid as usize + 1] += 1;
-                    bf.tmp.push((pid, (c.ts as u64) << 32 | bf.cl.len() as u64));
+                    bf.tmp.push([pid, c.ts, bf.cl.len() as u32]);
                     bf.cl.push((c.camp, c.line));
                 }
             }
         }
     }
+    sort_ts(&mut bf.tmp, &mut bf.tmp2);
     group(&bf.tmp, &mut bf.coff, &mut bf.pos, &mut bf.pc);
     let cx = PersonCtx { purch: &bf.purch, cl: &bf.cl, lo, organic };
     let mut side: Option<Map<(u64, u64), &[u8]>> = None;
     for i in 0..np {
+        if let Some(&(T_LINK, k)) = bf.keys.get(i + 16) {
+            prefetch(&links.ids[k[0] as usize][0]);
+        }
         let (tag, k) = bf.keys[i];
         match tag {
             T_SHORT => {
@@ -1009,8 +1122,8 @@ pub fn run_shard<'a>(routed: &[Routed<'a>], parsed: &[Parsed], links: &LinkMap<'
         }
         let pid = name_off.len() as u32 - 1;
         name_off.push(name_data.len() as u32);
-        let evs = &mut bf.pe[bf.off[i] as usize..bf.off[i + 1] as usize];
-        let cks = &mut bf.pc[bf.coff[i] as usize..bf.coff[i + 1] as usize];
+        let evs = &bf.pe[bf.off[i] as usize..bf.off[i + 1] as usize];
+        let cks = &bf.pc[bf.coff[i] as usize..bf.coff[i + 1] as usize];
         person(pid, evs, cks, &cx, sc, rows, acc);
     }
 }
@@ -1056,7 +1169,7 @@ fn credit(sess: &[Sess], cks: &[u64], cx: &PersonCtx<'_, '_>, acc: &mut Acc) {
     }
 }
 
-fn assists(starts: &[i64], days: &[i32], day_end: &[u32], ct: &[(u32, i64)], acc: &mut Acc) {
+fn assists(starts: &[i64], days: &[i32], day_end: &[u32], ct: &[u64], acc: &mut Acc) {
     let n = ct.len();
     let mut flush = |camp: u32, a: i64, b: i64| {
         let lo = starts.partition_point(|&s| s < a);
@@ -1071,12 +1184,12 @@ fn assists(starts: &[i64], days: &[i32], day_end: &[u32], ct: &[(u32, i64)], acc
     };
     let mut i = 0;
     while i < n {
-        let camp = ct[i].0;
-        let a = ct[i].1;
+        let camp = (ct[i] >> 32) as u32;
+        let a = ct[i] as u32 as i64;
         let mut b = a + WEEK_MS;
         i += 1;
-        while i < n && ct[i].0 == camp && ct[i].1 <= b {
-            b = b.max(ct[i].1 + WEEK_MS);
+        while i < n && (ct[i] >> 32) as u32 == camp && ct[i] as u32 as i64 <= b {
+            b = b.max(ct[i] as u32 as i64 + WEEK_MS);
             i += 1;
         }
         flush(camp, a, b);
