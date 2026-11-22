@@ -88,11 +88,7 @@ impl Out {
     fn flush(&mut self) -> io::Result<()> {
         if let Some(f) = self.file.as_mut() {
             if !self.buf.is_empty() {
-                #[cfg(feature = "tl")]
-                let t0 = crate::sys::tl::now();
                 f.write_all(&self.buf)?;
-                #[cfg(feature = "tl")]
-                crate::sys::tl::WR_IO.fetch_add(crate::sys::tl::now() - t0, std::sync::atomic::Ordering::Relaxed);
                 self.flushed += self.buf.len() as u64;
                 self.buf.clear();
             }
@@ -674,8 +670,6 @@ unsafe fn emit_rle(o: &mut Out, keys: &[u32], base: u32, w: u32) -> io::Result<(
     Ok(())
 }
 
-const RLE_KEYS: bool = crate::env_u32(option_env!("XL_RLEK_DEF"), 1) != 0;
-
 unsafe fn emit_dict_off(o: &mut Out, dict: &StrCol, keys: &[u32], base: u32, m: usize, w: u32) -> io::Result<Option<u64>> {
     let n = keys.len();
     if m == 0 {
@@ -689,7 +683,7 @@ unsafe fn emit_dict_off(o: &mut Out, dict: &StrCol, keys: &[u32], base: u32, m: 
     emit_dict_page_strs(o, dict)?;
     let data_off = o.pos();
     let packed = hybrid_len(m, w);
-    let rle = if RLE_KEYS { rle_len(keys, w) } else { usize::MAX };
+    let rle = rle_len(keys, w);
     let vals = 1 + packed.min(rle);
     let mut h = Vec::with_capacity(32);
     page_header(&mut h, P_DATA, vals, n, E_RLE_DICT);
@@ -858,22 +852,14 @@ fn encode_into(o: &mut Out, cols: &[Column], opts: &Opts) -> io::Result<()> {
     while a < n {
         let b = if n - a > rpg { a + rpg } else { n };
         let ds: Vec<Data> = cols.iter().map(|c| narrow(slice_data(&c.data, a, b))).collect();
-        #[cfg(feature = "tl")]
-        let tp = crate::sys::tl::now();
         let plans: Vec<Plan> = ds.iter().map(plan).collect();
-        #[cfg(feature = "tl")]
-        crate::sys::tl::WR_COL[7].fetch_add(crate::sys::tl::now() - tp, std::sync::atomic::Ordering::Relaxed);
         if o.file.is_none() {
             let bound: usize = ds.iter().zip(&plans).map(|(d, p)| chunk_bound(d, p)).sum();
             o.buf.reserve(bound + 512 + 160 * cols.len());
         }
         let mut metas = Vec::with_capacity(cols.len());
         for (_j, (d, p)) in ds.iter().zip(&plans).enumerate() {
-            #[cfg(feature = "tl")]
-            let tp = crate::sys::tl::now();
             metas.push(emit_chunk(o, d, p)?);
-            #[cfg(feature = "tl")]
-            crate::sys::tl::WR_COL[_j.min(6)].fetch_add(crate::sys::tl::now() - tp, std::sync::atomic::Ordering::Relaxed);
         }
         groups.push((b - a, metas));
         a = b;
@@ -950,7 +936,7 @@ unsafe fn emit_user_ids(o: &mut Out, d: &Data, head: usize, scratch: &mut Vec<u8
     let (ez, ep) = (run_count(kz) * (1 + vb), run_count(kp) * (1 + vb));
     let (pp, packed) = (hybrid_len(kp.len(), w), hybrid_len(n, w));
     let mut h = Vec::with_capacity(32);
-    if RLE_KEYS && ez + ep.min(pp) < packed {
+    if ez + ep.min(pp) < packed {
         scratch.clear();
         rle_into(scratch, kz, base, vb);
         let rle_tail = ep <= pp;
@@ -1112,33 +1098,14 @@ pub fn write_file(path: &Path, cols: &[Column], opts: &Opts, method: Method) -> 
     match method {
         Method::Whole => {
             let v = encode(cols, opts);
-            #[cfg(feature = "tl")]
-            let t0 = crate::sys::tl::now();
             let mut f = File::create(path)?;
-            #[cfg(feature = "tl")]
-            let t1 = crate::sys::tl::now();
             f.write_all(&v)?;
-            #[cfg(feature = "tl")]
-            {
-                crate::sys::tl::WR_OPEN.fetch_add(t1 - t0, std::sync::atomic::Ordering::Relaxed);
-                crate::sys::tl::WR_IO.fetch_add(crate::sys::tl::now() - t1, std::sync::atomic::Ordering::Relaxed);
-            }
             Ok(v.len() as u64)
         }
         Method::Stream(limit) => {
-            #[cfg(feature = "tl")]
-            let t0 = crate::sys::tl::now();
             let f = File::create(path)?;
-            #[cfg(feature = "tl")]
-            crate::sys::tl::WR_OPEN.fetch_add(crate::sys::tl::now() - t0, std::sync::atomic::Ordering::Relaxed);
             let mut o = Out { buf: Vec::with_capacity(limit + BLOCK * 64), flushed: 0, file: Some(f), limit };
             encode_into(&mut o, cols, opts)?;
-            #[cfg(feature = "tl")]
-            {
-                let t0 = crate::sys::tl::now();
-                drop(o.file.take());
-                crate::sys::tl::WR_CLOSE.fetch_add(crate::sys::tl::now() - t0, std::sync::atomic::Ordering::Relaxed);
-            }
             Ok(o.flushed)
         }
         Method::Mmap { populate } => {

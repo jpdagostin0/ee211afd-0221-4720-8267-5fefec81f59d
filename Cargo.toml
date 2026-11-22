@@ -8,13 +8,6 @@ publish = false
 name = "pipeline"
 path = "src/main.rs"
 
-[features]
-stats = []
-knobs = []
-testkeys = []
-pmu = []
-tl = []
-
 [dependencies]
 
 [profile.release]
