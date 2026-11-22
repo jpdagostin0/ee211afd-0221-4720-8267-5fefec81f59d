@@ -87,20 +87,18 @@ impl Part {
             }
         }
     }
-    pub fn lines_ptr(&self) -> *const u8 {
-        self.lines.as_ptr() as *const u8
-    }
     #[inline(always)]
-    pub unsafe fn push_many(&mut self, m: u64, n: usize, ob: *const u64, lp: *const u64, rec: *const [u64; 2]) {
+    pub unsafe fn push_many(&mut self, m: u64, n: usize, ob: *const u64, rec: *const [u64; 2]) {
         use std::arch::x86_64::*;
         let fill = self.fill.as_mut_ptr();
+        let lines = self.lines.as_mut_ptr() as *mut u8;
         let full = self.pend.as_mut_ptr() as *mut u64;
         let mut fp = full;
         macro_rules! row {
             ($i:expr) => {{
                 let i = $i;
-                let l = *lp.add(i) as *mut u8;
                 let b = *ob.add(i) as usize;
+                let l = lines.add(64 * b);
                 let mut f = *fill.add(b) as usize;
                 if f == 64 {
                     self.flush_full(full, fp.offset_from(full) as usize);
@@ -282,12 +280,6 @@ unsafe fn kst(a: *mut u8, i: usize, k: u8) {
     std::arch::asm!("kmovb byte ptr [{a} + {i}], {k}", a = in(reg) a, i = in(reg) i, k = in(kreg) k, options(nostack, preserves_flags));
 }
 #[inline(always)]
-fn kor(a: u8, b: u8) -> u8 {
-    let o: u8;
-    unsafe { std::arch::asm!("korb {o}, {a}, {b}", o = lateout(kreg) o, a = in(kreg) a, b = in(kreg) b, options(pure, nomem, nostack, preserves_flags)) };
-    o
-}
-#[inline(always)]
 fn kandn(a: u8, b: u8) -> u8 {
     let o: u8;
     unsafe { std::arch::asm!("kandnb {o}, {a}, {b}", o = lateout(kreg) o, a = in(kreg) a, b = in(kreg) b, options(pure, nomem, nostack, preserves_flags)) };
@@ -353,7 +345,6 @@ pub(crate) unsafe fn eq64(p: *const u8, c: u8) -> u64 {
 pub struct Out {
     rec: [[u64; 2]; NB],
     ob: [u64; NB],
-    lp: [u64; NB],
     pd: crate::ckix::Pend,
 }
 impl Out {
@@ -514,22 +505,19 @@ impl<'a> Ctx<'a> {
             return;
         }
         let g = self.g;
-        let p = EvP { ing_base: g.ing_base, ws: g.ws, wlen: g.wlen, ukey: g.ukey, ekey: g.ekey, ucap: g.ucap, ecap: g.ecap, ptab: self.tabs.prod.as_ptr(), lines: self.t.ev.lines_ptr() };
-        let (okb, spb, bad) = unsafe {
+        let p = EvP { ing_base: g.ing_base, ws: g.ws, wlen: g.wlen, ukey: g.ukey, ekey: g.ekey, ucap: g.ucap, ecap: g.ecap, ptab: self.tabs.prod.as_ptr() };
+        let (okb, spb) = unsafe {
             if (TS_BAD.wrapping_sub(p.ing_base) as u64) >= ING_MAX * 1000 {
                 ev_vec::<false>(&*self.eb, &mut *self.out, n, &p)
             } else {
                 ev_vec::<true>(&*self.eb, &mut *self.out, n, &p)
             }
         };
-        if bad {
-            fallback("ingest_ts bad or out of range");
-        }
         if unsafe { SKIP } & 2048 != 0 {
             self.t.prof[7] = self.t.prof[7].wrapping_add(okb ^ spb ^ self.out.rec[3][0] ^ self.out.rec[5][1] ^ self.out.ob[7]);
             return;
         }
-        unsafe { self.t.ev.push_many(okb, n, self.out.ob.as_ptr(), self.out.lp.as_ptr(), self.out.rec.as_ptr()) };
+        unsafe { self.t.ev.push_many(okb, n, self.out.ob.as_ptr(), self.out.rec.as_ptr()) };
         let mut m = spb;
         while m != 0 {
             let i = m.trailing_zeros() as usize;
@@ -606,7 +594,7 @@ impl<'a> Ctx<'a> {
             }
             return;
         }
-        let p = CkP { cbase: g.cbase, clen: g.clen, ukey: g.ukey, ucap: g.ucap, ckey: g.ckey, ccap: g.ccap, ctab: self.tabs.camp.as_ptr(), crange: self.tabs.crange, lines: self.t.us.lines_ptr() };
+        let p = CkP { cbase: g.cbase, clen: g.clen, ukey: g.ukey, ucap: g.ucap, ckey: g.ckey, ccap: g.ccap, ctab: self.tabs.camp.as_ptr(), crange: self.tabs.crange };
         let (okb, spb) = unsafe {
             match (p.crange.is_some(), p.ccap != 0) {
                 (true, false) => ck_vec::<true, false>(&*self.cb, &mut *self.out, n, &p),
@@ -615,7 +603,7 @@ impl<'a> Ctx<'a> {
                 (false, true) => ck_vec::<false, true>(&*self.cb, &mut *self.out, n, &p),
             }
         };
-        unsafe { self.t.us.push_many(okb, n, self.out.ob.as_ptr(), self.out.lp.as_ptr(), self.out.rec.as_ptr()) };
+        unsafe { self.t.us.push_many(okb, n, self.out.ob.as_ptr(), self.out.rec.as_ptr()) };
         let mut m = spb;
         while m != 0 {
             let i = m.trailing_zeros() as usize;
@@ -635,30 +623,28 @@ struct EvP {
     ucap: u64,
     ecap: u64,
     ptab: *const u8,
-    lines: *const u8,
 }
 
 #[inline(always)]
-unsafe fn ev_vec<const TSB: bool>(eb: &EvBatch, out: &mut Out, n: usize, p: &EvP) -> (u64, u64, bool) {
+unsafe fn ev_vec<const TSB: bool>(eb: &EvBatch, out: &mut Out, n: usize, p: &EvP) -> (u64, u64) {
     use std::arch::x86_64::*;
-    let mut mk = [[0u8; 16]; 3];
+    let mut mk = [[0u8; 16]; 2];
     let s = |v: u64| _mm256_set1_epi64x(v as i64);
     let m40 = s(crate::keyrec::MASK);
     let binv = s(crate::keyrec::BINV);
     let ainv = s(crate::keyrec::AINV);
     let ukey = s(p.ukey & crate::keyrec::MASK);
     let ekey = s(p.ekey & crate::keyrec::MASK);
-    let lim40 = s(1 << 40);
+    // only the low 40 bits of the result are the id
     let unscr = |yb: __m256i, key: __m256i| {
         let x = _mm256_and_si256(yb, m40);
         let x = _mm256_xor_si256(x, _mm256_xor_si256(_mm256_srli_epi64::<17>(x), _mm256_srli_epi64::<34>(x)));
-        _mm256_and_si256(mul4(_mm256_xor_si256(x, key), ainv), m40)
+        mul4(_mm256_xor_si256(x, key), ainv)
     };
     let ebp = eb as *const EvBatch as *const u8;
     const UID: usize = std::mem::offset_of!(EvBatch, uid);
     const EID: usize = std::mem::offset_of!(EvBatch, eid);
     const OB: usize = std::mem::offset_of!(Out, ob);
-    const LP: usize = std::mem::offset_of!(Out, lp);
     const RC: usize = std::mem::offset_of!(Out, rec);
     let outp = out as *mut Out as *mut u8;
     let ing_base = s(p.ing_base as u64);
@@ -670,14 +656,14 @@ unsafe fn ev_vec<const TSB: bool>(eb: &EvBatch, out: &mut Out, n: usize, p: &EvP
     let zero = _mm256_setzero_si256();
     let p24 = s(0xFF_FFFF);
     let day = s(DAY_MS as u64);
-    let ucap = s(p.ucap);
+    let ucap = s(p.ucap << 9);
     let nal = s(NALIAS);
     let ecap = s(p.ecap);
     let m511 = s(511);
     let slotm = s(BSIZE as u64 - 1);
     let magic = s(274_877_907);
+    let ingm = s(ING_MAX << 16);
     let ones = s(u64::MAX);
-    let lines = s(p.lines as u64);
     let ix_lo = _mm256_setr_epi64x(0, 4, 1, 5);
     let ix_hi = _mm256_setr_epi64x(2, 6, 3, 7);
     let mut j = 0;
@@ -685,8 +671,8 @@ unsafe fn ev_vec<const TSB: bool>(eb: &EvBatch, out: &mut Out, n: usize, p: &EvP
     while j < n {
         let ingr = _mm256_load_si256(eb.ing.as_ptr().add(j) as *const __m256i);
         let ing = _mm256_sub_epi64(ingr, ing_base);
-        let bad = if TSB { kor(_mm256_cmpeq_epi64_mask(ingr, ts_bad), _mm256_cmpge_epu64_mask(ing, ing_lim)) } else { _mm256_cmpge_epu64_mask(ing, ing_lim) };
-        let ing_s = _mm256_srli_epi64::<38>(_mm256_mul_epu32(ing, magic));
+        let good = if TSB { _mm256_mask_cmplt_epu64_mask(_mm256_cmpneq_epi64_mask(ingr, ts_bad), ing, ing_lim) } else { _mm256_cmplt_epu64_mask(ing, ing_lim) };
+        let ing_s = _mm256_srli_epi64::<22>(_mm256_mul_epu32(ing, magic));
         let ts = _mm256_load_si256(eb.ts.as_ptr().add(j) as *const __m256i);
         let rel = _mm256_sub_epi64(ts, ws);
         let eid = _mm256_load_si256(eb.eid.as_ptr().add(j) as *const __m256i);
@@ -697,41 +683,35 @@ unsafe fn ev_vec<const TSB: bool>(eb: &EvBatch, out: &mut Out, n: usize, p: &EvP
         let valid = _mm256_mask_cmplt_epu64_mask(valid, rel, wlen);
         let valid = _mm256_mask_cmpgt_epi64_mask(valid, pp, ones);
         let valid = _mm256_mask_cmple_epi64_mask(valid, _mm256_sub_epi64(ingr, ts), day);
-        let w = unscr(mul4m::<UID>(ebp, j, binv), ukey);
-        let user = _mm256_srli_epi64::<9>(w);
+        // w and v keep bits 40 and up of the scrambled id, so an id past 40 bits fails the range checks; w is 0 on a row that is not valid
+        let w = _mm256_maskz_ternarylogic_epi64::<0xE4>(valid, unscr(mul4m::<UID>(ebp, j, binv), ukey), uid, m40);
         let alias = _mm256_and_si256(w, m511);
-        let normal = _mm256_mask_cmplt_epu64_mask(_mm256_mask_cmplt_epu64_mask(_mm256_cmplt_epu64_mask(uid, lim40), user, ucap), alias, nal);
         let pm = _mm256_mask_cmpneq_epi64_mask(valid, price, zero);
-        let w0v = _mm256_or_si256(_mm256_or_si256(_mm256_slli_epi64::<33>(rel), _mm256_slli_epi64::<9>(price)), alias);
+        let w0v = _mm256_ternarylogic_epi64::<0xFE>(_mm256_slli_epi64::<33>(rel), _mm256_slli_epi64::<9>(price), alias);
         let w0v = _mm256_mask_blend_epi64(valid, ones, w0v);
-        let userv = _mm256_maskz_mov_epi64(valid, user);
-        let v = unscr(mul4m::<EID>(ebp, j, binv), ekey);
-        let evok = _mm256_mask_cmplt_epu64_mask(_mm256_cmplt_epu64_mask(eid, lim40), v, ecap);
-        let w1v = _mm256_or_si256(_mm256_and_si256(v, slotm), _mm256_or_si256(_mm256_slli_epi64::<16>(ing_s), _mm256_slli_epi64::<37>(userv)));
-        let ok = kandn(kandn(normal, valid), evok);
+        let v = _mm256_ternarylogic_epi64::<0xE4>(unscr(mul4m::<EID>(ebp, j, binv), ekey), eid, m40);
+        let ok = _mm256_mask_cmplt_epu64_mask(_mm256_mask_cmplt_epu64_mask(_mm256_mask_cmplt_epu64_mask(good, v, ecap), w, ucap), alias, nal);
+        let w1v = _mm256_ternarylogic_epi64::<0xE4>(ing_s, _mm256_ternarylogic_epi64::<0xF8>(_mm256_slli_epi64::<28>(w), v, slotm), ingm);
         let bv = _mm256_srli_epi64::<{ BB as i32 }>(v);
         st4::<RC>(outp, 2 * j, _mm256_permutex2var_epi64(w0v, ix_lo, w1v));
         st4::<{ RC + 32 }>(outp, 2 * j, _mm256_permutex2var_epi64(w0v, ix_hi, w1v));
         st4::<OB>(outp, j, bv);
-        st4::<LP>(outp, j, _mm256_add_epi64(_mm256_slli_epi64::<6>(bv), lines));
-        kst(mk[0].as_mut_ptr(), g, bad);
-        kst(mk[1].as_mut_ptr(), g, pm);
-        kst(mk[2].as_mut_ptr(), g, ok);
+        kst(mk[0].as_mut_ptr(), g, pm);
+        kst(mk[1].as_mut_ptr(), g, ok);
         j += 4;
         g += 1;
     }
     let nm = if n >= 64 { !0 } else { (1u64 << n) - 1 };
-    let badb = mask64(&mk[0]);
-    let okb = mask64(&mk[2]) & nm;
+    let okb = mask64(&mk[1]) & nm;
     let spb = !okb & nm;
-    let mut pmb = mask64(&mk[1]) & nm;
+    let mut pmb = mask64(&mk[0]) & nm;
     while pmb != 0 {
         let i = pmb.trailing_zeros() as usize;
         pmb &= pmb - 1;
         let prod = (*eb.pp.get_unchecked(i) as u32 as usize).min(PBOUND);
         out.rec.get_unchecked_mut(i)[0] |= (*p.ptab.add(prod) as u64) << 4;
     }
-    (okb, spb, badb & nm != 0)
+    (okb, spb)
 }
 
 struct CkP {
@@ -743,7 +723,6 @@ struct CkP {
     ccap: u64,
     ctab: *const u8,
     crange: Option<(u64, u64)>,
-    lines: *const u8,
 }
 
 #[inline(always)]
@@ -765,12 +744,10 @@ unsafe fn ck_vec<const RANGED: bool, const MODE_A: bool>(cb: &CkBatch, out: &mut
     let nal = s(NALIAS);
     let m511 = s(511);
     let ulo = s(UBSIZE as u64 - 1);
-    let lines = s(p.lines as u64);
     let (clo, cspan) = (s(p.crange.unwrap_or((0, 0)).0), s(p.crange.unwrap_or((0, 0)).1));
     let cbp = cb as *const CkBatch as *const u8;
     const UID: usize = std::mem::offset_of!(CkBatch, uid);
     const OB: usize = std::mem::offset_of!(Out, ob);
-    const LP: usize = std::mem::offset_of!(Out, lp);
     const RC: usize = std::mem::offset_of!(Out, rec);
     let outp = out as *mut Out as *mut u8;
     let ix_lo = _mm256_setr_epi64x(0, 4, 1, 5);
@@ -814,7 +791,6 @@ unsafe fn ck_vec<const RANGED: bool, const MODE_A: bool>(cb: &CkBatch, out: &mut
         st4::<RC>(outp, 2 * j, _mm256_permutex2var_epi64(o0, ix_lo, o1));
         st4::<{ RC + 32 }>(outp, 2 * j, _mm256_permutex2var_epi64(o0, ix_hi, o1));
         st4::<OB>(outp, j, bv);
-        st4::<LP>(outp, j, _mm256_add_epi64(_mm256_slli_epi64::<6>(bv), lines));
         kst(mk[0].as_mut_ptr(), g, ok);
         kst(mk[1].as_mut_ptr(), g, keep);
         j += 4;
@@ -1125,13 +1101,11 @@ fn lk_batch(c: &mut Ctx, buf: &[u8], lb: &mut LkBatch, n: usize) {
         let nal = s(NALIAS);
         let m511 = s(511);
         let ulo = s(UBSIZE as u64 - 1);
-        let lines = s(c.t.us.lines_ptr() as u64);
         let link = s(1 << 63);
         let zero = _mm256_setzero_si256();
         let ix_lo = _mm256_setr_epi64x(0, 4, 1, 5);
         let ix_hi = _mm256_setr_epi64x(2, 6, 3, 7);
         const OB: usize = std::mem::offset_of!(Out, ob);
-        const LP: usize = std::mem::offset_of!(Out, lp);
         const RC: usize = std::mem::offset_of!(Out, rec);
         const LA: usize = std::mem::offset_of!(LkBatch, a);
         const LBB: usize = std::mem::offset_of!(LkBatch, b);
@@ -1160,7 +1134,6 @@ fn lk_batch(c: &mut Ctx, buf: &[u8], lb: &mut LkBatch, n: usize) {
             st4::<RC>(outp, 2 * j, _mm256_permutex2var_epi64(o0, ix_lo, zero));
             st4::<{ RC + 32 }>(outp, 2 * j, _mm256_permutex2var_epi64(o0, ix_hi, zero));
             st4::<OB>(outp, j, bv);
-            st4::<LP>(outp, j, _mm256_add_epi64(_mm256_slli_epi64::<6>(bv), lines));
             kst(mk[0].as_mut_ptr(), j / 4, ok);
             kst(mk[1].as_mut_ptr(), j / 4, kandn(ok, ne));
             kst(mk[2].as_mut_ptr(), j / 4, dok);
@@ -1169,7 +1142,7 @@ fn lk_batch(c: &mut Ctx, buf: &[u8], lb: &mut LkBatch, n: usize) {
     }
     let nm = if n >= 64 { !0 } else { (1u64 << n) - 1 };
     let (okb, mut genb, decb) = unsafe { (mask64(&mk[0]) & nm, mask64(&mk[1]) & nm, mask64(&mk[2]) & nm) };
-    unsafe { c.t.us.push_many(okb, n, out.ob.as_ptr(), out.lp.as_ptr(), out.rec.as_ptr()) };
+    unsafe { c.t.us.push_many(okb, n, out.ob.as_ptr(), out.rec.as_ptr()) };
     c.t.n_lk_rows += decb.count_ones() as u64;
     let mut slow = !decb & nm;
     while slow != 0 {
@@ -1473,7 +1446,6 @@ mod tests {
                 ucap: 1 + r.below(1 << 26),
                 ecap: 1 + r.below(1 << 28),
                 ptab: prod.as_ptr(),
-                lines: (r.below(1 << 40) << 6) as *const u8,
             };
             let n = 1 + r.below(64) as usize;
             let mut rows = Vec::new();
@@ -1537,22 +1509,22 @@ mod tests {
                 eb.uid[i] = r.next();
                 eb.pp[i] = r.next();
             }
-            let (okb, spb, bad) = unsafe { ev_vec::<true>(&eb, &mut out, n, &p) };
+            let (okb, spb) = unsafe { ev_vec::<true>(&eb, &mut out, n, &p) };
             if (TS_BAD.wrapping_sub(p.ing_base) as u64) >= ING_MAX * 1000 {
                 let rec = out.rec;
-                assert_eq!(unsafe { ev_vec::<false>(&eb, &mut out, n, &p) }, (okb, spb, bad));
+                assert_eq!(unsafe { ev_vec::<false>(&eb, &mut out, n, &p) }, (okb, spb));
                 assert_eq!(&rec[..n], &out.rec[..n]);
             }
             assert_eq!(okb & spb, 0);
             assert_eq!((okb | spb).count_ones() as usize, n, "round {round}");
-            let mut any_bad = false;
             for (i, row) in rows.iter().enumerate() {
                 let back = eb.row(i);
                 let want_prod = if row.kind == 2 || row.product == PROD_EMPTY { row.product } else { PROD_ODD };
                 assert_eq!(back, EvRow { product: want_prod, ..*row });
                 let ing = row.ingest.wrapping_sub(p.ing_base) as u64;
                 if row.ingest == TS_BAD || ing >= ING_MAX * 1000 {
-                    any_bad = true;
+                    assert!(spb >> i & 1 == 1, "round {round} row {i}: {row:?}");
+                    n_bad += 1;
                     continue;
                 }
                 let ing_s = ing / 1000;
@@ -1594,12 +1566,9 @@ mod tests {
                 } else {
                     assert!(okb >> i & 1 == 1, "round {round} row {i}: {row:?}");
                     assert_eq!(Some((out.ob[i], out.rec[i][0], out.rec[i][1])), pushed, "round {round} row {i}: {row:?}");
-                    assert_eq!(out.lp[i], p.lines as u64 + 64 * out.ob[i]);
                     n_ok += 1;
                 }
             }
-            assert_eq!(bad, any_bad, "round {round}");
-            n_bad += any_bad as u32;
         }
         assert!(n_ok > 100_000 && n_sp > 10_000 && n_bad > 1000, "{n_ok} {n_sp} {n_bad}");
     }
@@ -1629,7 +1598,7 @@ mod tests {
             let we = ws + ((1 + r.below(24)) * DAY_MS as u64) as i64;
             let t = round % 3;
             let camp = &tabs[t];
-            let p = CkP { cbase: ws - 7 * DAY_MS, clen: (we - ws + 7 * DAY_MS) as u64, ukey: r.next(), ucap: 1 + r.below(1 << 26), ckey: 0, ccap: 0, ctab: camp.as_ptr(), crange: camp_range(&camp[..CBOUND]), lines: (r.below(1 << 40) << 6) as *const u8 };
+            let p = CkP { cbase: ws - 7 * DAY_MS, clen: (we - ws + 7 * DAY_MS) as u64, ukey: r.next(), ucap: 1 + r.below(1 << 26), ckey: 0, ccap: 0, ctab: camp.as_ptr(), crange: camp_range(&camp[..CBOUND]) };
             let n = 1 + r.below(64) as usize;
             let mut rows = Vec::new();
             for _ in 0..n {
@@ -1708,7 +1677,6 @@ mod tests {
                     Some(x) => {
                         assert!(okb >> i & 1 == 1, "round {round} row {i}");
                         assert_eq!((out.ob[i], out.rec[i][0], out.rec[i][1]), x);
-                        assert_eq!(out.lp[i], p.lines as u64 + 64 * out.ob[i]);
                         n_ok += 1;
                     }
                     None => {
@@ -1739,7 +1707,6 @@ mod tests {
                 };
                 for i in 0..64 {
                     out.ob[i] = r.below(nb as u64);
-                    out.lp[i] = p2.lines_ptr() as u64 + 64 * out.ob[i];
                     out.rec[i] = [r.next(), r.next()];
                 }
                 let mut mm = m;
@@ -1748,7 +1715,7 @@ mod tests {
                     mm &= mm - 1;
                     p1.push(out.ob[i] as usize, out.rec[i][0], out.rec[i][1]);
                 }
-                unsafe { p2.push_many(m, n, out.ob.as_ptr(), out.lp.as_ptr(), out.rec.as_ptr()) };
+                unsafe { p2.push_many(m, n, out.ob.as_ptr(), out.rec.as_ptr()) };
                 let b = r.below(nb as u64) as usize;
                 let (x, y) = (r.next(), r.next());
                 p1.push(b, x, y);
