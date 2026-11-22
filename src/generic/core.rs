@@ -94,7 +94,7 @@ fn hex32(b: &[u8; 32]) -> Option<[u64; 2]> {
 
 #[inline]
 fn khash(tag: u8, k: [u64; 2]) -> u64 {
-    mix(mix(k[0] ^ C[0], k[1] ^ C[1] ^ tag as u64) ^ C[2], C[3])
+    mix(k[0] ^ C[0], k[1] ^ C[1] ^ tag as u64)
 }
 
 pub struct Names<'a> {
@@ -295,17 +295,17 @@ impl<T: Copy> Bins<T> {
     }
     #[inline]
     fn push(&mut self, arena: &mut Arena, s: usize, x: T) {
-        let b = &mut self.bins[s];
-        self.stage[s * STAGE + b.staged].write(x);
+        let b = unsafe { self.bins.get_unchecked_mut(s) };
+        unsafe { self.stage.get_unchecked_mut(s * STAGE + b.staged).write(x) };
         b.staged += 1;
         if b.staged == STAGE {
             if b.at == b.end {
                 self.grow(arena, s);
             }
             let b = &mut self.bins[s];
-            let src = self.stage[s * STAGE..].as_ptr() as *const __m256i;
+            let (at, src) = (b.at as *mut __m256i, self.stage[s * STAGE..].as_ptr() as *const __m256i);
             for i in 0..STAGE * std::mem::size_of::<T>() / 32 {
-                unsafe { _mm256_stream_si256((b.at as *mut __m256i).add(i), _mm256_loadu_si256(src.add(i))) };
+                unsafe { _mm256_stream_si256(at.add(i), _mm256_loadu_si256(src.add(i))) };
             }
             b.at = unsafe { b.at.add(STAGE) };
             b.staged = 0;
@@ -365,7 +365,7 @@ impl Tab32 {
         let tag = ((h >> 32) << self.bits) as u32;
         let mut i = from & mask;
         loop {
-            let s = self.slots[i];
+            let s = unsafe { *self.slots.get_unchecked(i) };
             if s == 0 {
                 return Err(i);
             }
@@ -380,7 +380,7 @@ impl Tab32 {
     }
     #[inline]
     fn set(&mut self, slot: usize, h: u64, idx: u32) {
-        self.slots[slot] = ((h >> 32) << self.bits) as u32 | (idx + 1);
+        unsafe { *self.slots.get_unchecked_mut(slot) = ((h >> 32) << self.bits) as u32 | (idx + 1) };
     }
     #[inline]
     fn held(&self, slot: usize) -> u32 {
@@ -678,6 +678,8 @@ pub fn dedup_route(parsed: &[Parsed], s: usize, links: &LinkMap<'_>, nshard: usi
     out.tab.reset(blk.len() * per, 2 * total);
     out.hits.clear();
     out.sel.clear();
+    out.sel.reserve(blk.len() * per);
+    let sel = out.sel.as_mut_ptr();
     let mut hs = [0u64; BATCH];
     let mut first = 0;
     for p in parsed {
@@ -686,7 +688,7 @@ pub fn dedup_route(parsed: &[Parsed], s: usize, links: &LinkMap<'_>, nshard: usi
                 for (i, e) in sub.iter().enumerate() {
                     hs[i] = khash(e.etag, e.eid);
                     prefetch(&out.tab.slots[hs[i] as usize & (out.tab.slots.len() - 1)]);
-                    out.sel.push(Rec { k: e.user, ts: e.ts, pt: e.pt, cat: e.cat, tag: e.utag });
+                    unsafe { sel.add(first + c * BATCH + i).write(Rec { k: e.user, ts: e.ts, pt: e.pt, cat: e.cat, tag: e.utag }) };
                 }
                 for (i, (e, &h)) in sub.iter().zip(&hs).enumerate() {
                     let idx = (first + c * BATCH + i) as u32;
@@ -696,10 +698,13 @@ pub fn dedup_route(parsed: &[Parsed], s: usize, links: &LinkMap<'_>, nshard: usi
                     }
                 }
             }
+            for j in b.len()..per {
+                unsafe { sel.add(first + j).write(Rec { k: [0; 2], ts: 0, pt: T_INVALID << 24, cat: 0, tag: 0 }) };
+            }
             first += per;
-            out.sel.resize(first, Rec { k: [0; 2], ts: 0, pt: T_INVALID << 24, cat: 0, tag: 0 });
         }
     }
+    unsafe { out.sel.set_len(first) };
     for j in 0..out.hits.len() {
         if let Some(n) = out.hits.get(j + 16) {
             let o = at(out.tab.held(n.slot as usize));
@@ -1010,9 +1015,11 @@ fn group(tmp: &[[u32; 3]], off: &mut [u32], pos: &mut Vec<u32>, out: &mut Vec<u6
     out.clear();
     out.resize(tmp.len(), 0);
     for &[pid, ts, low] in tmp {
-        let q = &mut pos[pid as usize];
-        out[*q as usize] = (ts as u64) << 32 | low as u64;
-        *q += 1;
+        unsafe {
+            let q = pos.get_unchecked_mut(pid as usize);
+            *out.get_unchecked_mut(*q as usize) = (ts as u64) << 32 | low as u64;
+            *q += 1;
+        }
     }
 }
 
@@ -1032,7 +1039,7 @@ pub fn run_shard<'a>(routed: &[Routed<'a>], parsed: &[Parsed], links: &LinkMap<'
         for blk in r.rec.blocks(p) {
             for e in blk {
                 let h = khash(e.tag, e.k);
-                let pid = match bf.tab.find(h, |i| bf.keys[i as usize] == (e.tag, e.k)) {
+                let pid = match bf.tab.find(h, |i| unsafe { *bf.keys.get_unchecked(i as usize) } == (e.tag, e.k)) {
                     Ok((_, i)) => i,
                     Err(slot) => {
                         let i = bf.keys.len() as u32;
@@ -1053,13 +1060,14 @@ pub fn run_shard<'a>(routed: &[Routed<'a>], parsed: &[Parsed], links: &LinkMap<'
                         i
                     }
                 };
-                bf.off[pid as usize + 1] += 1;
+                unsafe { *bf.off.get_unchecked_mut(pid as usize + 1) += 1 };
                 let mut low = 0;
                 if e.pt >> 24 == T_PURCHASE {
                     bf.purch.push((e.pt & 0x00ff_ffff, e.cat));
                     low = bf.purch.len() as u32;
                 }
-                bf.tmp.push([pid, e.ts, low]);
+                unsafe { bf.tmp.as_mut_ptr().add(bf.tmp.len()).write([pid, e.ts, low]) };
+                unsafe { bf.tmp.set_len(bf.tmp.len() + 1) };
             }
         }
     }
@@ -1073,7 +1081,7 @@ pub fn run_shard<'a>(routed: &[Routed<'a>], parsed: &[Parsed], links: &LinkMap<'
     for r in routed {
         for blk in r.ck.blocks(p) {
             for c in blk {
-                if let Ok((_, pid)) = bf.tab.find(khash(c.tag, c.k), |i| bf.keys[i as usize] == (c.tag, c.k)) {
+                if let Ok((_, pid)) = bf.tab.find(khash(c.tag, c.k), |i| unsafe { *bf.keys.get_unchecked(i as usize) } == (c.tag, c.k)) {
                     bf.coff[pid as usize + 1] += 1;
                     bf.tmp.push([pid, c.ts, bf.cl.len() as u32]);
                     bf.cl.push((c.camp, c.line));
