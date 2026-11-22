@@ -11,31 +11,11 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-const ES: usize = 256;
-const PS: usize = 256;
+const SHARD_BYTES: usize = 4 << 20;
+const CK_TASK: usize = 1 << 16;
 
 fn take<T: Default>(m: &Mutex<T>) -> T {
     std::mem::take(&mut *m.lock().unwrap_or_else(|e| e.into_inner()))
-}
-
-enum P1<'a> {
-    None,
-    E(Parts<Ev<'a>>),
-    C(Vec<Ck0<'a>>),
-}
-enum P2<'a> {
-    R(Parts<Rec<'a>>),
-    C(Parts<Ck<'a>>),
-}
-
-#[derive(Default)]
-struct P1Bufs<'a> {
-    ev: Vec<(Ev<'a>, u32)>,
-}
-#[derive(Default)]
-struct P2Bufs<'a> {
-    d: DedupBufs<'a>,
-    ck: Vec<(Ck<'a>, u32)>,
 }
 
 pub fn run(data_dir: &Path, out_dir: &Path, ncpu: usize) -> io::Result<()> {
@@ -104,14 +84,20 @@ pub fn run(data_dir: &Path, out_dir: &Path, ncpu: usize) -> io::Result<()> {
     let ev_chunks = chunks(&ev_files, chunk_target(&ev_files, ncpu));
     let ck_chunks = chunks(&ck_files, chunk_target(&ck_files, ncpu));
     let lk_chunks = chunks(&lk_files, chunk_target(&lk_files, ncpu));
+    let lo = ws - WEEK_MS;
+    if we - lo > u32::MAX as i64 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "manifest: window too long"));
+    }
+    let ev_bytes: usize = ev_files.iter().map(|f| f.len()).sum();
+    let nshard = (ev_bytes / SHARD_BYTES).next_power_of_two().min(4096);
     lap("setup");
 
-    let ectx = EvCtx { ws, we, products: &products, unknown_cat };
+    let ectx = EvCtx { lo, ws, we, products: &products, unknown_cat };
     let (nl, ne, nc) = (lk_chunks.len(), ev_chunks.len(), ck_chunks.len());
     let lk_parts: Vec<Mutex<LinkPart>> = (0..nl).map(|_| Mutex::new(Vec::new())).collect();
     let lk_done = AtomicUsize::new(0);
     let links_slot: Mutex<Option<LinkMap>> = Mutex::new(None);
-    let (res, _) = par_run(nl + ne + nc, ncpu, P1Bufs::default, |bf, i| {
+    let (_, parsed) = par_run(nl + ne + nc, ncpu, || Parsed::new(nshard), |st, i| {
         if i < nl {
             let v = parse_links(lk_chunks[i]);
             *lk_parts[i].lock().unwrap() = v;
@@ -120,58 +106,35 @@ pub fn run(data_dir: &Path, out_dir: &Path, ncpu: usize) -> io::Result<()> {
                 let lm = build_links(&parts);
                 *links_slot.lock().unwrap() = Some(lm);
             }
-            P1::None
         } else if i < nl + ne {
-            P1::E(parse_events(ev_chunks[i - nl], &ectx, ES, &mut bf.ev))
+            parse_events(ev_chunks[i - nl], (i - nl) as u16, &ectx, st);
         } else {
-            P1::C(parse_clicks(ck_chunks[i - nl - ne], ws, we, &campaigns))
+            parse_clicks(ck_chunks[i - nl - ne], lo, we, &campaigns, &mut st.ck);
         }
     });
     let links = links_slot.into_inner().unwrap().unwrap_or_else(|| build_links(&[]));
     drop(lk_parts);
-    let mut ev_parts: Vec<Parts<Ev>> = Vec::with_capacity(ne);
-    let mut ck_parts: Vec<Vec<Ck0>> = Vec::with_capacity(nc);
-    for r in res {
-        match r {
-            P1::E(v) => ev_parts.push(v),
-            P1::C(c) => ck_parts.push(c),
-            P1::None => {}
-        }
-    }
+    drop(evm);
     lap("parse+links");
 
-    let nck = ck_parts.len();
-    let (res, _) = par_run(ES + nck, ncpu, P2Bufs::default, |bf, i| {
-        if i < ES {
-            P2::R(dedup_route(&ev_parts, i, &links, PS, &mut bf.d))
+    let ck_tasks: Vec<(usize, usize)> = parsed.iter().enumerate().flat_map(|(t, p)| (0..p.ck.len()).step_by(CK_TASK).map(move |o| (t, o))).collect();
+    let (_, routed) = par_run(nshard + ck_tasks.len(), ncpu, || Routed::new(nshard), |st, i| {
+        if i < nshard {
+            dedup_route(&parsed, i, &links, nshard, st);
         } else {
-            P2::C(route_clicks(&ck_parts[i - ES], &links, PS, &mut bf.ck))
+            let (t, o) = ck_tasks[i - nshard];
+            let v = &parsed[t].ck;
+            route_clicks(&v[o..(o + CK_TASK).min(v.len())], &links, nshard, st);
         }
     });
-    drop(ev_parts);
-    drop(ck_parts);
-    drop(links);
-    let mut rec_parts: Vec<Parts<Rec>> = Vec::with_capacity(ES);
-    let mut ckr_parts: Vec<Parts<Ck>> = Vec::with_capacity(nck);
-    for r in res {
-        match r {
-            P2::R(v) => rec_parts.push(v),
-            P2::C(v) => ckr_parts.push(v),
-        }
-    }
+    let sides: Vec<Vec<Vec<u8>>> = parsed.into_iter().map(|p| p.side).collect();
     lap("dedup+route");
 
     let ncat = cat_names.len();
-    let (rows, states) = par_run(
-        PS,
-        ncpu,
-        || (Scratch::new(ncat), ShardBufs::default(), Acc::default()),
-        |st, p| run_shard(&rec_parts, &ckr_parts, p, organic, &mut st.0, &mut st.1, &mut st.2),
-    );
-    drop(rec_parts);
-    drop(ckr_parts);
+    let (_, mut workers) = par_run(nshard, ncpu, || Worker::new(ncat), |w, p| run_shard(&routed, &sides, &links, p, lo, organic, w));
     let mut acc: Acc = Acc::default();
-    for (_, _, a) in states {
+    for w in &mut workers {
+        let a = std::mem::take(&mut w.acc);
         if acc.is_empty() {
             acc = a;
             continue;
@@ -190,21 +153,19 @@ pub fn run(data_dir: &Path, out_dir: &Path, ncpu: usize) -> io::Result<()> {
     std::fs::create_dir_all(&cd)?;
     clear_parquet(&ud)?;
     clear_parquet(&cd)?;
-    let nparts = ncpu.min(PS).max(1);
-    let per = PS.div_ceil(nparts);
+    let nparts = workers.len();
     let (res, _) = par_run(nparts + 1, ncpu, || (), |_, k| {
         if k == nparts {
             write_campaigns(&cd.join("part-0.parquet"), &acc, &camp_ids, &channels)
         } else {
-            let group = &rows[(k * per).min(PS)..((k + 1) * per).min(PS)];
-            write_users(&ud.join(format!("part-{k}.parquet")), group, &cat_names)
+            write_users(&ud.join(format!("part-{k}.parquet")), &workers[k], &cat_names)
         }
     });
     for r in res {
         r?;
     }
     lap("write");
-    drop(rows);
+    drop(workers);
     drop(acc);
     lap("free");
     Ok(())
@@ -242,30 +203,22 @@ impl StrBuf {
 
 const STREAM: pqw::Method = pqw::Method::Stream(1 << 20);
 
-fn write_users(path: &Path, group: &[Vec<UserRow>], cat_names: &[B]) -> io::Result<()> {
+fn write_users(path: &Path, w: &Worker, cat_names: &[B]) -> io::Result<()> {
     use pqw::*;
-    let n: usize = group.iter().map(|g| g.len()).sum();
-    let mut names = StrBuf::new(n / 2, n * 12);
+    let n = w.rows.len();
     let mut ukeys: Vec<u32> = Vec::with_capacity(n);
     let mut day = Vec::with_capacity(n);
     let mut s = Vec::with_capacity(n);
     let mut ev = Vec::with_capacity(n);
     let mut rev = Vec::with_capacity(n);
     let mut top: Vec<u32> = Vec::with_capacity(n);
-    let mut prev: Option<&[u8]> = None;
-    for g in group {
-        for r in g {
-            if prev != Some(r.name) {
-                names.push(r.name);
-                prev = Some(r.name);
-            }
-            ukeys.push((names.off.len() - 2) as u32);
-            day.push(r.day);
-            s.push(r.sessions as i64);
-            ev.push(r.events as i64);
-            rev.push(r.revenue as i64);
-            top.push(r.top.unwrap_or(u32::MAX));
-        }
+    for r in &w.rows {
+        ukeys.push(r.person);
+        day.push(r.day);
+        s.push(r.sessions as i64);
+        ev.push(r.events as i64);
+        rev.push(r.revenue as i64);
+        top.push(r.top.unwrap_or(u32::MAX));
     }
     let mut cats = StrBuf::new(cat_names.len(), 0);
     for c in cat_names {
@@ -284,7 +237,7 @@ fn write_users(path: &Path, group: &[Vec<UserRow>], cat_names: &[B]) -> io::Resu
         Keys::U32(&top)
     };
     let cols = [
-        Column { name: "user_id", data: Data::Dict { dict: names.col(), keys: Keys::U32(&ukeys), nullable: false, plain: false } },
+        Column { name: "user_id", data: Data::Dict { dict: StrCol { offsets: &w.name_off, data: &w.name_data }, keys: Keys::U32(&ukeys), nullable: false, plain: false } },
         Column { name: "day", data: Data::Date(&day, IntEnc::Dense) },
         Column { name: "sessions", data: Data::I64(&s, IntEnc::Auto) },
         Column { name: "events", data: Data::I64(&ev, IntEnc::Auto) },

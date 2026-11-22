@@ -1,4 +1,5 @@
 use super::util::{count_byte, eq_mask64, find_byte, find_sub};
+use std::cell::Cell;
 use std::io;
 
 pub type B<'a> = &'a [u8];
@@ -109,20 +110,62 @@ pub fn split<'a, const N: usize>(line: B<'a>) -> Option<[B<'a>; N]> {
 }
 
 #[inline]
-pub unsafe fn first_two<'a>(p: &'a u8) -> (B<'a>, B<'a>) {
-    let p0 = p as *const u8;
-    let mut q = p0;
-    while *q != b',' {
-        q = q.add(1);
+pub fn for_rows<'a, const N: usize>(chunk: B<'a>, mut f: impl FnMut(&'a u8, [B<'a>; N])) {
+    let n = chunk.len();
+    let mut ends = [0usize; N];
+    let mut k = 0usize;
+    let mut line = 0usize;
+    let mut after_sep = 1u64;
+    let mut after_inner = 0u64;
+    let mut stray_before = false;
+    let mut base = 0usize;
+    while base + 64 <= n {
+        let blk = &chunk[base..];
+        let nl = eq_mask64(blk, b'\n');
+        let sep = nl | eq_mask64(blk, b',');
+        let inner = eq_mask64(blk, b'"') & !(sep << 1 | after_sep);
+        let mut stray = (inner << 1 | after_inner) & !sep;
+        after_sep = sep >> 63;
+        after_inner = inner >> 63;
+        let mut m = sep;
+        while m != 0 {
+            let bit = m & m.wrapping_neg();
+            let p = base + m.trailing_zeros() as usize;
+            ends[k.min(N - 1)] = p;
+            k += 1;
+            if nl & bit != 0 {
+                let clean = stray & (bit - 1) == 0 && !stray_before;
+                stray &= !(bit - 1);
+                stray_before = false;
+                if k == N && clean && p > line {
+                    let mut out: [B<'a>; N] = [&[]; N];
+                    let mut s = line;
+                    let mut ok = true;
+                    for i in 0..N {
+                        let e = ends[i];
+                        let o = (chunk[s] == b'"') as usize;
+                        let c = (chunk[e - (e > s) as usize] == b'"') as usize;
+                        ok &= o == c && e - s >= o + c;
+                        out[i] = unsafe { chunk.get_unchecked(s + o..(e - c).max(s + o)) };
+                        s = e + 1;
+                    }
+                    if ok {
+                        f(&chunk[line], out);
+                    }
+                }
+                k = 0;
+                line = p + 1;
+            }
+            m ^= bit;
+        }
+        stray_before |= stray != 0;
+        base += 64;
     }
-    let f0 = std::slice::from_raw_parts(p0, q.offset_from(p0) as usize);
-    let p1 = q.add(1);
-    let mut q = p1;
-    while *q != b',' {
-        q = q.add(1);
-    }
-    let f1 = std::slice::from_raw_parts(p1, q.offset_from(p1) as usize);
-    (strip(f0), strip(f1))
+    for_lines(&chunk[line..], |l| {
+        if let Some(r) = split::<N>(l) {
+            f(&l[0], r);
+        }
+    });
 }
 
 #[inline]
@@ -167,18 +210,18 @@ fn is_leap(y: i64) -> bool {
     y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)
 }
 
-#[inline]
-fn civil(s: &[u8]) -> Option<i64> {
-    if s[4] != b'-' || s[7] != b'-' || s[10] != b'T' || s[13] != b':' || s[16] != b':' {
+thread_local! {
+    static DAYS: [Cell<(u64, u32, i64)>; 64] = const { [const { Cell::new((0, 1, 0)) }; 64] };
+}
+
+fn date(s: &[u8]) -> Option<i64> {
+    if s[4] != b'-' || s[7] != b'-' || s[10] != b'T' {
         return None;
     }
     let y = d2(s[0], s[1])? * 100 + d2(s[2], s[3])?;
     let mo = d2(s[5], s[6])?;
     let d = d2(s[8], s[9])?;
-    let h = d2(s[11], s[12])?;
-    let mi = d2(s[14], s[15])?;
-    let se = d2(s[17], s[18])?;
-    if !(1..=12).contains(&mo) || h > 23 || mi > 59 || se > 59 || d < 1 {
+    if !(1..=12).contains(&mo) || d < 1 {
         return None;
     }
     let dim = match mo {
@@ -195,42 +238,69 @@ fn civil(s: &[u8]) -> Option<i64> {
     if d > dim {
         return None;
     }
-    Some((days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + se) * 1000)
+    Some(days_from_civil(y, mo, d) * DAY_MS)
+}
+
+#[inline]
+fn civil(s: &[u8]) -> Option<i64> {
+    let k0 = u64::from_le_bytes(s[..8].try_into().unwrap());
+    let k1 = u32::from_le_bytes(s[7..11].try_into().unwrap());
+    let day = DAYS.with(|days| {
+        let slot = &days[((k1 >> 16 & 15) | (k1 >> 4 & 48)) as usize];
+        let (a, b, ms) = slot.get();
+        if a == k0 && b == k1 {
+            return Some(ms);
+        }
+        let ms = date(s)?;
+        slot.set((k0, k1, ms));
+        Some(ms)
+    })?;
+    let x = u64::from_le_bytes(s[11..19].try_into().unwrap()) ^ 0x3030_3a30_303a_3030;
+    if (x | x.wrapping_add(0x0606_0f06_060f_0606)) & 0xf0f0_f0f0_f0f0_f0f0 != 0 {
+        return None;
+    }
+    let t = x.wrapping_mul(0xa01);
+    let (h, mi, se) = ((t >> 8 & 255) as i64, (t >> 32 & 255) as i64, (t >> 56) as i64);
+    if h > 23 || mi > 59 || se > 59 {
+        return None;
+    }
+    Some(day + (h * 3600 + mi * 60 + se) * 1000)
+}
+
+const POW10: [i64; 9] = [1, 10, 100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000, 100_000_000];
+
+#[inline]
+fn digits8(x: u64) -> i64 {
+    let x = x.wrapping_mul(0xa01) >> 8 & 0x00ff_00ff_00ff_00ff;
+    let x = x.wrapping_mul(0x64_0001) >> 16 & 0x0000_ffff_0000_ffff;
+    (x.wrapping_mul(0x2710_0000_0001) >> 32) as i64
+}
+
+fn epoch(s: &[u8]) -> Option<i64> {
+    if s.is_empty() || !s.iter().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let mut i = 0;
+    while i < s.len() && s[i] == b'0' {
+        i += 1;
+    }
+    let r = &s[i..];
+    if r.len() > 18 {
+        return None;
+    }
+    let mut v: i64 = 0;
+    for &b in r {
+        v = v * 10 + (b - b'0') as i64;
+    }
+    Some(v)
 }
 
 #[inline]
 pub fn parse_ts(s: &[u8]) -> Option<i64> {
-    if s.is_empty() {
-        return None;
-    }
-    if s.iter().all(|b| b.is_ascii_digit()) {
-        let mut i = 0;
-        while i < s.len() && s[i] == b'0' {
-            i += 1;
-        }
-        let r = &s[i..];
-        if r.len() > 18 {
-            return None;
-        }
-        let mut v: i64 = 0;
-        for &b in r {
-            v = v * 10 + (b - b'0') as i64;
-        }
-        return Some(v);
-    }
-    match s.len() {
-        20 => {
-            if s[19] != b'Z' {
-                return None;
-            }
-            civil(s)
-        }
-        25 => {
-            let sign = match s[19] {
-                b'+' => 1,
-                b'-' => -1,
-                _ => return None,
-            };
+    let n = s.len();
+    match n {
+        20 if s[19] == b'Z' => civil(s),
+        25 if s[19] == b'+' || s[19] == b'-' => {
             if s[22] != b':' {
                 return None;
             }
@@ -239,9 +309,18 @@ pub fn parse_ts(s: &[u8]) -> Option<i64> {
             if oh > 23 || om > 59 {
                 return None;
             }
-            civil(s).map(|t| t - sign * (oh * 3600 + om * 60) * 1000)
+            let off = (oh * 3600 + om * 60) * 1000;
+            civil(s).map(|t| if s[19] == b'+' { t - off } else { t + off })
         }
-        _ => None,
+        9..=16 => {
+            let hi = u64::from_le_bytes(s[..8].try_into().unwrap()) ^ 0x3030_3030_3030_3030;
+            let lo = u64::from_le_bytes(s[n - 8..].try_into().unwrap()) ^ 0x3030_3030_3030_3030;
+            if (hi | lo | hi.wrapping_add(0x0606_0606_0606_0606) | lo.wrapping_add(0x0606_0606_0606_0606)) & 0xf0f0_f0f0_f0f0_f0f0 != 0 {
+                return None;
+            }
+            Some(digits8(hi) * POW10[n - 8] + digits8(lo & (!0 << (8 * (16 - n)))))
+        }
+        _ => epoch(s),
     }
 }
 
@@ -296,6 +375,308 @@ pub fn manifest(data: &[u8]) -> io::Result<(i64, i64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn old_civil(s: &[u8]) -> Option<i64> {
+        if s[4] != b'-' || s[7] != b'-' || s[10] != b'T' || s[13] != b':' || s[16] != b':' {
+            return None;
+        }
+        let y = d2(s[0], s[1])? * 100 + d2(s[2], s[3])?;
+        let mo = d2(s[5], s[6])?;
+        let d = d2(s[8], s[9])?;
+        let h = d2(s[11], s[12])?;
+        let mi = d2(s[14], s[15])?;
+        let se = d2(s[17], s[18])?;
+        if !(1..=12).contains(&mo) || h > 23 || mi > 59 || se > 59 || d < 1 {
+            return None;
+        }
+        let dim = match mo {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            _ => {
+                if is_leap(y) {
+                    29
+                } else {
+                    28
+                }
+            }
+        };
+        if d > dim {
+            return None;
+        }
+        Some((days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + se) * 1000)
+    }
+
+    fn old_ts(s: &[u8]) -> Option<i64> {
+        if s.is_empty() {
+            return None;
+        }
+        if s.iter().all(|b| b.is_ascii_digit()) {
+            let mut i = 0;
+            while i < s.len() && s[i] == b'0' {
+                i += 1;
+            }
+            let r = &s[i..];
+            if r.len() > 18 {
+                return None;
+            }
+            let mut v: i64 = 0;
+            for &b in r {
+                v = v * 10 + (b - b'0') as i64;
+            }
+            return Some(v);
+        }
+        match s.len() {
+            20 => {
+                if s[19] != b'Z' {
+                    return None;
+                }
+                old_civil(s)
+            }
+            25 => {
+                let sign = match s[19] {
+                    b'+' => 1,
+                    b'-' => -1,
+                    _ => return None,
+                };
+                if s[22] != b':' {
+                    return None;
+                }
+                let oh = d2(s[20], s[21])?;
+                let om = d2(s[23], s[24])?;
+                if oh > 23 || om > 59 {
+                    return None;
+                }
+                old_civil(s).map(|t| t - sign * (oh * 3600 + om * 60) * 1000)
+            }
+            _ => None,
+        }
+    }
+
+    fn old_rows<const N: usize>(chunk: &[u8]) -> Vec<(usize, [(usize, usize); N])> {
+        let at = |f: &[u8]| -> usize { f.as_ptr() as usize - chunk.as_ptr() as usize };
+        let mut out = Vec::new();
+        for line in chunk.split(|&b| b == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let fields: Vec<&[u8]> = line.split(|&b| b == b',').collect();
+            if fields.len() != N {
+                continue;
+            }
+            let mut row = [(0usize, 0usize); N];
+            let mut ok = true;
+            for (i, f) in fields.iter().enumerate() {
+                let n = f.len();
+                if !f.contains(&b'"') {
+                    row[i] = (at(f), n);
+                } else if n >= 2 && f[0] == b'"' && f[n - 1] == b'"' && !f[1..n - 1].contains(&b'"') {
+                    row[i] = (at(f) + 1, n - 2);
+                } else {
+                    ok = false;
+                }
+            }
+            if ok {
+                out.push((at(line), row));
+            }
+        }
+        out
+    }
+
+    fn new_rows<const N: usize>(chunk: &[u8]) -> Vec<(usize, [(usize, usize); N])> {
+        let at = |p: *const u8| -> usize { p as usize - chunk.as_ptr() as usize };
+        let mut out = Vec::new();
+        for_rows::<N>(chunk, |line, fields| out.push((at(line), fields.map(|f| (at(f.as_ptr()), f.len())))));
+        out
+    }
+
+    fn split_rows<const N: usize>(chunk: &[u8]) -> Vec<(usize, [(usize, usize); N])> {
+        let at = |p: *const u8| -> usize { p as usize - chunk.as_ptr() as usize };
+        let mut out = Vec::new();
+        for_lines(chunk, |l| {
+            if let Some(fields) = split::<N>(l) {
+                out.push((at(l.as_ptr()), fields.map(|f| (at(f.as_ptr()), f.len()))));
+            }
+        });
+        out
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+        fn pick(&mut self, set: &[u8]) -> u8 {
+            set[self.below(set.len())]
+        }
+    }
+
+    fn check_rows(chunk: &[u8]) {
+        assert_eq!(new_rows::<1>(chunk), old_rows::<1>(chunk), "{:?}", String::from_utf8_lossy(chunk));
+        assert_eq!(new_rows::<2>(chunk), old_rows::<2>(chunk), "{:?}", String::from_utf8_lossy(chunk));
+        assert_eq!(new_rows::<4>(chunk), old_rows::<4>(chunk), "{:?}", String::from_utf8_lossy(chunk));
+        assert_eq!(new_rows::<7>(chunk), old_rows::<7>(chunk), "{:?}", String::from_utf8_lossy(chunk));
+        assert_eq!(split_rows::<2>(chunk), old_rows::<2>(chunk), "{:?}", String::from_utf8_lossy(chunk));
+        assert_eq!(split_rows::<7>(chunk), old_rows::<7>(chunk), "{:?}", String::from_utf8_lossy(chunk));
+    }
+
+    fn random_line(r: &mut Rng, out: &mut Vec<u8>) {
+        const WORDS: [&[u8]; 12] = [
+            b"e6d3t175y",
+            b"u02423c3d84ab053af78764ce49f23b5c",
+            b"2027-12-18T07:05:50-09:30",
+            b"2027-12-19T08:16:10Z",
+            b"1829203731000",
+            b"purchase",
+            b"p4837",
+            b"",
+            b"\"",
+            b"\"\"",
+            b"\r",
+            b"\xef\xbc\x92 ",
+        ];
+        let shape = r.below(20);
+        if shape == 0 {
+            for _ in 0..r.below(4) {
+                out.push(r.pick(b",\"\ra\xff"));
+            }
+            return;
+        }
+        let fields = match r.below(12) {
+            0 => r.below(10),
+            1 => 2,
+            2 => 4,
+            3 => 1,
+            _ => 7,
+        };
+        for i in 0..fields {
+            if i > 0 {
+                out.push(b',');
+            }
+            let quoted = r.below(5) == 0;
+            if quoted {
+                out.push(b'"');
+            }
+            let words = if r.below(30) == 0 { 12 } else { 8 };
+            out.extend_from_slice(WORDS[r.below(words)]);
+            if shape == 1 && r.below(4) == 0 {
+                for _ in 0..[70, 130, 5000][r.below(3)] {
+                    out.push(r.pick(b"abc 0"));
+                }
+            }
+            if r.below(60) == 0 {
+                out.push(r.pick(b"\"\r \xc3"));
+            }
+            if quoted && r.below(80) != 0 {
+                out.push(b'"');
+            }
+        }
+    }
+
+    #[test]
+    fn rows_match_split() {
+        let mut r = Rng(0x9e37_79b9_7f4a_7c15);
+        let mut chunk: Vec<u8> = Vec::new();
+        for round in 0..60_000 {
+            chunk.clear();
+            let lines = if round % 16 == 0 { 40 } else { r.below(6) };
+            for _ in 0..lines {
+                random_line(&mut r, &mut chunk);
+                chunk.push(b'\n');
+            }
+            if r.below(3) == 0 {
+                random_line(&mut r, &mut chunk);
+            }
+            for _ in 0..r.below(3) {
+                if !chunk.is_empty() {
+                    let at = r.below(chunk.len());
+                    match r.below(3) {
+                        0 => chunk[at] = r.pick(b",\"\n\r\xff0"),
+                        1 => chunk.insert(at, r.pick(b",\"\n\r\xff0")),
+                        _ => {
+                            chunk.remove(at);
+                        }
+                    }
+                }
+            }
+            check_rows(&chunk);
+        }
+        let mut r = Rng(77);
+        for len in 0..600 {
+            for _ in 0..40 {
+                chunk.clear();
+                for _ in 0..len {
+                    chunk.push(r.pick(b",,\"\n\n\ra0"));
+                }
+                check_rows(&chunk);
+            }
+        }
+    }
+
+    #[test]
+    fn rows() {
+        let mut got: Vec<(u8, [Vec<u8>; 3])> = Vec::new();
+        let text = b"a,\"b\",c\n\n\"\",,\"x y\"\r\nbad\",1,2\n\"\"\",1,2\n1,2\n1,2,3,4\n\",1,2\n\"q\"x,1,2\nlast,\"\",9";
+        for_rows::<3>(text, |line, f| got.push((*line, f.map(|x| x.to_vec()))));
+        let want: Vec<(u8, [Vec<u8>; 3])> = vec![(b'a', [b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]), (b'l', [b"last".to_vec(), b"".to_vec(), b"9".to_vec()])];
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn ts_matches_old() {
+        let mut r = Rng(0x2545_f491_4f6c_dd1d);
+        let mut s: Vec<u8> = Vec::new();
+        for round in 0..6_000_000u32 {
+            s.clear();
+            let form = r.below(10);
+            if form < 5 {
+                let (y, mo, d) = match r.below(8) {
+                    0 => (r.below(10_000), r.below(14), r.below(33)),
+                    1 => (2024 + r.below(6), 2, 27 + r.below(4)),
+                    _ => (2027, 11 + r.below(2), 1 + r.below(31)),
+                };
+                let (h, mi, se) = if r.below(20) == 0 { (r.below(26), r.below(62), r.below(62)) } else { (r.below(24), r.below(60), r.below(60)) };
+                s.extend_from_slice(format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{se:02}").as_bytes());
+                if form < 3 {
+                    s.push(b'Z');
+                } else {
+                    let (oh, om) = if r.below(10) == 0 { (r.below(26), r.below(62)) } else { (r.below(24), r.below(60)) };
+                    s.extend_from_slice(format!("{}{oh:02}:{om:02}", if r.below(2) == 0 { '+' } else { '-' }).as_bytes());
+                }
+            } else if form < 9 {
+                for _ in 0..r.below(4) * r.below(4) {
+                    s.push(b'0');
+                }
+                for _ in 0..[13, 13, 13, r.below(30)][r.below(4)] {
+                    s.push(b'0' + r.below(10) as u8);
+                }
+            } else {
+                for _ in 0..r.below(28) {
+                    s.push(r.next() as u8);
+                }
+            }
+            for _ in 0..[0, 0, 1, 1, 2, 5][round as usize % 6] {
+                if !s.is_empty() {
+                    let at = r.below(s.len());
+                    match r.below(8) {
+                        0 => s.insert(at, r.pick(b"0123456789-:TZ+ ")),
+                        1 => {
+                            s.remove(at);
+                        }
+                        2 => s[at] = r.next() as u8,
+                        _ => s[at] = r.pick(b"0123456789-:TZtz+. /;\xd9\xa2"),
+                    }
+                }
+            }
+            assert_eq!(parse_ts(&s), old_ts(&s), "{:?}", String::from_utf8_lossy(&s));
+        }
+    }
+
     #[test]
     fn ts() {
         assert_eq!(parse_ts(b"2026-10-03T23:58:10Z"), Some(1791071890000));
@@ -303,14 +684,29 @@ mod tests {
         assert_eq!(parse_ts(b"1791071890000"), Some(1791071890000));
         assert_eq!(parse_ts(b"0001791071890000"), Some(1791071890000));
         assert_eq!(parse_ts(b"2026-10-03T23:58:10z"), None);
+        assert_eq!(parse_ts(b"2026-10-03t23:58:10Z"), None);
+        assert_eq!(parse_ts(b"2026-10-03 23:58:10Z"), None);
         assert_eq!(parse_ts(b"2026-02-29T00:00:00Z"), None);
         assert_eq!(parse_ts(b"2028-02-29T00:00:00Z").is_some(), true);
         assert_eq!(parse_ts(b"2026-10-03T19:58:10+24:00"), None);
+        assert_eq!(parse_ts(b"2026-10-03T19:58:10+05:60"), None);
         assert_eq!(parse_ts(b"2026-10-03T19:58:10+0200"), None);
         assert_eq!(parse_ts(b"2026-10-03T19:58:10-00:00"), parse_ts(b"2026-10-03T19:58:10Z"));
         assert_eq!(parse_ts(b"2026-10-03T24:00:00Z"), None);
         assert_eq!(parse_ts(b"2026-10-03T23:59:60Z"), None);
         assert_eq!(parse_ts(b"1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(parse_ts(b""), None);
+        assert_eq!(parse_ts(b"86400000"), Some(86_400_000));
+        assert_eq!(parse_ts(b"1791071890000.0"), None);
+        assert_eq!(parse_ts(b"1.79e12"), None);
+        assert_eq!(parse_ts(b"-5"), None);
+        assert_eq!(parse_ts(b"179107189000\r"), None);
+        assert_eq!(parse_ts(b"00000000000000000001"), Some(1));
+        assert_eq!(parse_ts(b"00123456789012345678"), Some(123_456_789_012_345_678));
+        assert_eq!(parse_ts(b"01234567890123456789"), None);
+        assert_eq!(parse_ts(b"0000000000000000000000001"), Some(1));
+        assert_eq!(parse_ts("179107189000٢".as_bytes()), None);
+        assert_eq!(parse_ts("１７９１０７１８９００００".as_bytes()), None);
         assert_eq!(parse_price(b"0250"), Some(250));
         assert_eq!(parse_price(b"10000000"), Some(10_000_000));
         assert_eq!(parse_price(b"10000001"), None);
@@ -319,12 +715,6 @@ mod tests {
         assert_eq!(split::<2>(b"a,b\""), None);
         assert_eq!(split::<2>(b"a,b,c"), None);
         assert_eq!(split::<2>(b"a"), None);
-        let l = b"\"e1\",u 1,x,y";
-        let (a, b) = unsafe { first_two(&l[0]) };
-        assert_eq!((a, b), (&b"e1"[..], &b"u 1"[..]));
-        let l = b",\"\",x";
-        let (a, b) = unsafe { first_two(&l[0]) };
-        assert_eq!((a, b), (&b""[..], &b""[..]));
     }
     #[test]
     fn lines() {

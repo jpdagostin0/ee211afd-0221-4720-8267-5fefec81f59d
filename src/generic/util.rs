@@ -1,3 +1,4 @@
+use std::arch::x86_64::{__m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_set1_epi8};
 use std::fs::File;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::io;
@@ -80,75 +81,15 @@ pub fn new_map<K, V>(n: usize) -> Map<K, V> {
     Map::with_capacity_and_hasher(n, BuildHasherDefault::default())
 }
 
-pub struct Tab {
-    slots: Vec<u64>,
-    mask: usize,
-}
-impl Default for Tab {
-    fn default() -> Self {
-        Tab { slots: Vec::new(), mask: 0 }
-    }
-}
-impl Tab {
-    pub fn reset(&mut self, n: usize) {
-        let cap = (n.saturating_mul(2)).max(16).next_power_of_two();
-        if self.slots.capacity() < cap {
-            self.slots = vec![0u64; cap];
-        } else {
-            self.slots.clear();
-            self.slots.resize(cap, 0);
-        }
-        self.mask = cap - 1;
-    }
-    pub fn with_capacity(n: usize) -> Tab {
-        let cap = (n.saturating_mul(2)).max(16).next_power_of_two();
-        Tab { slots: vec![0u64; cap], mask: cap - 1 }
-    }
-    #[inline]
-    pub fn find(&self, h: u64, mut eq: impl FnMut(u32) -> bool) -> Result<(usize, u32), usize> {
-        let tag = h >> 32;
-        let mut i = (h as usize) & self.mask;
-        loop {
-            let s = self.slots[i];
-            if s == 0 {
-                return Err(i);
-            }
-            if s >> 32 == tag {
-                let idx = (s as u32).wrapping_sub(1);
-                if eq(idx) {
-                    return Ok((i, idx));
-                }
-            }
-            i = (i + 1) & self.mask;
-        }
-    }
-    #[inline]
-    pub fn set(&mut self, slot: usize, h: u64, idx: u32) {
-        self.slots[slot] = ((h >> 32) << 32) | (idx as u64 + 1);
-    }
-}
-
-
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
 #[inline(always)]
 pub fn eq_mask64(p: &[u8], c: u8) -> u64 {
-    use std::arch::x86_64::*;
-    assert!(p.len() >= 64);
-    #[allow(unused_unsafe)]
+    let p: &[u8; 64] = p[..64].try_into().unwrap();
     unsafe {
-        let v = _mm512_loadu_si512(p.as_ptr() as *const _);
-        _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(c as i8))
+        let k = _mm256_set1_epi8(c as i8);
+        let lo = _mm256_cmpeq_epi8(_mm256_loadu_si256(p.as_ptr() as *const __m256i), k);
+        let hi = _mm256_cmpeq_epi8(_mm256_loadu_si256(p.as_ptr().add(32) as *const __m256i), k);
+        (_mm256_movemask_epi8(lo) as u32 as u64) | ((_mm256_movemask_epi8(hi) as u32 as u64) << 32)
     }
-}
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512bw")))]
-#[inline(always)]
-pub fn eq_mask64(p: &[u8], c: u8) -> u64 {
-    let p = &p[..64];
-    let mut m = 0u64;
-    for i in 0..64 {
-        m |= ((p[i] == c) as u64) << i;
-    }
-    m
 }
 
 #[inline]
