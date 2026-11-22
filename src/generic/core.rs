@@ -138,7 +138,7 @@ impl<'a> Names<'a> {
             i = (i + 1) & mask;
         }
     }
-    #[inline]
+    #[inline(always)]
     fn get(&self, b: B<'_>) -> Option<u32> {
         if b.len() > 15 {
             return self.long.get(b).copied();
@@ -147,7 +147,7 @@ impl<'a> Names<'a> {
         let mask = self.slots.len() - 1;
         let mut i = khash(T_SHORT, k) as usize & mask;
         loop {
-            let s = &self.slots[i];
+            let s = unsafe { self.slots.get_unchecked(i) };
             if s.1 == u32::MAX {
                 return None;
             }
@@ -673,7 +673,7 @@ const BATCH: usize = 32;
 pub fn dedup_route(parsed: &[Parsed], s: usize, links: &LinkMap<'_>, nshard: usize, out: &mut Routed<'_>) {
     let per = Bins::<Ev>::PER;
     let blk: Vec<*mut Ev> = parsed.iter().flat_map(|p| p.ev.list(s).iter().copied()).collect();
-    let at = |i: u32| unsafe { blk[i as usize / per].add(i as usize % per) };
+    let at = |i: u32| unsafe { blk.get_unchecked(i as usize / per).add(i as usize % per) };
     let total: usize = parsed.iter().map(|p| p.ev.len(s)).sum();
     out.tab.reset(blk.len() * per, 2 * total);
     out.hits.clear();
@@ -687,7 +687,7 @@ pub fn dedup_route(parsed: &[Parsed], s: usize, links: &LinkMap<'_>, nshard: usi
             for (c, sub) in b.chunks(BATCH).enumerate() {
                 for (i, e) in sub.iter().enumerate() {
                     hs[i] = khash(e.etag, e.eid);
-                    prefetch(&out.tab.slots[hs[i] as usize & (out.tab.slots.len() - 1)]);
+                    prefetch(unsafe { out.tab.slots.get_unchecked(hs[i] as usize & (out.tab.slots.len() - 1)) });
                     unsafe { sel.add(first + c * BATCH + i).write(Rec { k: e.user, ts: e.ts, pt: e.pt, cat: e.cat, tag: e.utag }) };
                 }
                 for (i, (e, &h)) in sub.iter().zip(&hs).enumerate() {
@@ -740,7 +740,7 @@ pub fn dedup_route(parsed: &[Parsed], s: usize, links: &LinkMap<'_>, nshard: usi
         while keep != 0 {
             let i = keep.trailing_zeros() as usize;
             keep &= keep - 1;
-            let r = &sub[i];
+            let r = unsafe { sub.get_unchecked(i) };
             let (tag, k) = links.person(r.tag, r.k, hs[i]);
             let h = if tag == T_LINK { khash(tag, k) } else { hs[i] };
             out.rec.push(&mut out.arena, shard_of(h, nshard), Rec { k, tag, ..*r });
@@ -904,16 +904,17 @@ fn person(pid: u32, evs: &[u64], cks: &[u64], cx: &PersonCtx<'_, '_>, sc: &mut S
         prev = ts;
         d.events += 1;
         if e as u32 != 0 {
-            let (price, cat) = cx.purch[e as u32 as usize - 1];
+            let (price, cat) = unsafe { *cx.purch.get_unchecked(e as u32 as usize - 1) };
             let price = price as u64;
             let s = sc.sess.last_mut().unwrap();
             s.rev += price;
             s.purch = true;
             d.revenue += price;
-            if sc.catsum[cat as usize] == 0 {
+            let sum = unsafe { sc.catsum.get_unchecked_mut(cat as usize) };
+            if *sum == 0 {
                 sc.touched.push(cat);
             }
-            sc.catsum[cat as usize] += price;
+            *sum += price;
         }
     }
     flush_row(pid, &d, sc, rows);
@@ -1170,7 +1171,7 @@ fn credit(sess: &[Sess], cks: &[u64], cx: &PersonCtx<'_, '_>, acc: &mut Acc) {
             camp = best.0;
         }
         let c = acc.cell(camp, s.day);
-        let a = &mut acc.credit[c];
+        let a = unsafe { acc.credit.get_unchecked_mut(c) };
         a.0 += 1;
         a.1 += s.purch as u32;
         a.2 += s.rev;
@@ -1186,7 +1187,7 @@ fn assists(starts: &[i64], days: &[i32], day_end: &[u32], ct: &[u64], acc: &mut 
         while k < hi {
             let e = (day_end[k] as usize).min(hi);
             let c = acc.cell(camp, days[k]);
-            acc.assist[c] += (e - k) as u32;
+            unsafe { *acc.assist.get_unchecked_mut(c) += (e - k) as u32 };
             k = e;
         }
     };
