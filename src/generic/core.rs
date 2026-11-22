@@ -110,6 +110,7 @@ extern "C" {
 
 const MADV_DONTNEED: i32 = 4;
 const MADV_HUGEPAGE: i32 = 14;
+const MADV_POPULATE_READ: i32 = 22;
 const MADV_POPULATE_WRITE: i32 = 23;
 
 fn advise<T>(p: *const T, n: usize, advice: i32) {
@@ -118,6 +119,10 @@ fn advise<T>(p: *const T, n: usize, advice: i32) {
     if e > a {
         unsafe { madvise(a as *mut u8, e - a, advice) };
     }
+}
+
+pub fn prefault(c: B<'_>) {
+    advise(c.as_ptr(), c.len(), MADV_POPULATE_READ);
 }
 
 pub fn release(c: B<'_>) {
@@ -180,12 +185,14 @@ struct Bin<T> {
     at: *mut T,
     end: *mut T,
     staged: usize,
-    blocks: Vec<*mut T>,
+    blocks: usize,
 }
 
 struct Bins<T> {
     bins: Vec<Bin<T>>,
     stage: Vec<MaybeUninit<T>>,
+    tab: Vec<*mut T>,
+    stride: usize,
 }
 unsafe impl<T: Send> Send for Bins<T> {}
 unsafe impl<T: Sync> Sync for Bins<T> {}
@@ -196,7 +203,26 @@ impl<T: Copy> Bins<T> {
     fn new(n: usize) -> Self {
         let mut stage: Vec<MaybeUninit<T>> = Vec::new();
         stage.resize_with(n * STAGE, MaybeUninit::uninit);
-        Bins { bins: (0..n).map(|_| Bin { at: std::ptr::null_mut(), end: std::ptr::null_mut(), staged: 0, blocks: Vec::new() }).collect(), stage }
+        Bins { bins: (0..n).map(|_| Bin { at: std::ptr::null_mut(), end: std::ptr::null_mut(), staged: 0, blocks: 0 }).collect(), stage, tab: vec![std::ptr::null_mut(); n * 32], stride: 32 }
+    }
+    fn grow(&mut self, arena: &mut Arena, s: usize) {
+        if self.bins[s].blocks == self.stride {
+            let stride = self.stride * 2;
+            let mut tab = vec![std::ptr::null_mut(); self.bins.len() * stride];
+            for (new, old) in tab.chunks_mut(stride).zip(self.tab.chunks(self.stride)) {
+                new[..old.len()].copy_from_slice(old);
+            }
+            self.tab = tab;
+            self.stride = stride;
+        }
+        let b = &mut self.bins[s];
+        b.at = arena.block() as *mut T;
+        b.end = unsafe { b.at.add(Self::PER) };
+        self.tab[s * self.stride + b.blocks] = b.at;
+        b.blocks += 1;
+    }
+    fn list(&self, s: usize) -> &[*mut T] {
+        &self.tab[s * self.stride..s * self.stride + self.bins[s].blocks]
     }
     #[inline]
     fn push(&mut self, arena: &mut Arena, s: usize, x: T) {
@@ -205,10 +231,9 @@ impl<T: Copy> Bins<T> {
         b.staged += 1;
         if b.staged == STAGE {
             if b.at == b.end {
-                b.at = arena.block() as *mut T;
-                b.end = unsafe { b.at.add(Self::PER) };
-                b.blocks.push(b.at);
+                self.grow(arena, s);
             }
+            let b = &mut self.bins[s];
             let src = self.stage[s * STAGE..].as_ptr() as *const __m256i;
             for i in 0..STAGE * std::mem::size_of::<T>() / 32 {
                 unsafe { _mm256_stream_si256((b.at as *mut __m256i).add(i), _mm256_loadu_si256(src.add(i))) };
@@ -218,15 +243,14 @@ impl<T: Copy> Bins<T> {
         }
     }
     fn finish(&mut self, arena: &mut Arena) {
-        for (s, b) in self.bins.iter_mut().enumerate() {
-            if b.staged == 0 {
+        for s in 0..self.bins.len() {
+            if self.bins[s].staged == 0 {
                 continue;
             }
-            if b.at == b.end {
-                b.at = arena.block() as *mut T;
-                b.end = unsafe { b.at.add(Self::PER) };
-                b.blocks.push(b.at);
+            if self.bins[s].at == self.bins[s].end {
+                self.grow(arena, s);
             }
+            let b = &mut self.bins[s];
             unsafe {
                 std::ptr::copy_nonoverlapping(self.stage[s * STAGE..].as_ptr() as *const T, b.at, b.staged);
                 b.at = b.at.add(b.staged);
@@ -235,19 +259,18 @@ impl<T: Copy> Bins<T> {
         }
     }
     fn len(&self, s: usize) -> usize {
-        let b = &self.bins[s];
-        match b.blocks.last() {
-            Some(&p) => (b.blocks.len() - 1) * Self::PER + unsafe { b.at.offset_from(p) } as usize,
+        match self.list(s).last() {
+            Some(&p) => (self.bins[s].blocks - 1) * Self::PER + unsafe { self.bins[s].at.offset_from(p) } as usize,
             None => 0,
         }
     }
     fn blocks(&self, s: usize) -> impl Iterator<Item = &[T]> {
-        let b = &self.bins[s].blocks;
+        let b = self.list(s);
         let last = self.len(s) - b.len().saturating_sub(1) * Self::PER;
         b.iter().enumerate().map(move |(j, &p)| unsafe { std::slice::from_raw_parts(p, if j + 1 == b.len() { last } else { Self::PER }) })
     }
     fn get(&self, s: usize, i: usize) -> &T {
-        unsafe { &*self.bins[s].blocks[i / Self::PER].add(i % Self::PER) }
+        unsafe { &*self.list(s)[i / Self::PER].add(i % Self::PER) }
     }
 }
 
@@ -260,7 +283,11 @@ impl Tab32 {
     fn reset(&mut self, n: usize, slots: usize) {
         self.bits = usize::BITS - n.leading_zeros();
         self.slots.clear();
-        self.slots.resize(slots.next_power_of_two().max(16), 0);
+        let slots = slots.next_power_of_two().max(16);
+        if self.slots.capacity() < slots {
+            extend(&mut self.slots, slots);
+        }
+        self.slots.resize(slots, 0);
     }
     #[inline]
     fn find(&self, h: u64, mut eq: impl FnMut(u32) -> bool) -> Result<(usize, u32), usize> {
@@ -350,6 +377,7 @@ pub type LinkPart<'a> = Vec<[Id<'a>; 2]>;
 
 pub fn parse_links(c: B<'_>) -> LinkPart<'_> {
     let mut v = Vec::with_capacity(count_lines(c) + 1);
+    advise(v.as_ptr(), v.capacity(), MADV_POPULATE_WRITE);
     for_rows(c, |_, ab: [B; 2]| {
         if !ab[0].is_empty() && !ab[1].is_empty() {
             v.push(ab.map(|text| {
@@ -368,9 +396,12 @@ pub fn build_links<'a>(parts: &[LinkPart<'a>], huge: bool) -> LinkMap<'a> {
     if huge {
         advise(slots.as_ptr(), mask + 1, MADV_HUGEPAGE);
     }
+    advise(slots.as_ptr(), mask + 1, MADV_POPULATE_WRITE);
     slots.resize(mask + 1, Slot { k: [0; 2], tag: 0, name: 0 });
     let mut ids: Vec<B<'a>> = Vec::with_capacity(n + n / 2);
     let mut parent: Vec<u32> = Vec::with_capacity(n + n / 2);
+    advise(ids.as_ptr(), ids.capacity(), MADV_POPULATE_WRITE);
+    advise(parent.as_ptr(), parent.capacity(), MADV_POPULATE_WRITE);
     for p in parts {
         for blk in p.chunks(16) {
             for id in blk.iter().flatten() {
@@ -622,7 +653,7 @@ pub fn dedup_route(parsed: &[Parsed], s: usize, links: &LinkMap<'_>, nshard: usi
         }
     }
     for p in parsed {
-        out.arena.pool.extend(p.ev.bins[s].blocks.iter().map(|&b| b as *mut u8));
+        out.arena.pool.extend(p.ev.list(s).iter().map(|&b| b as *mut u8));
     }
     unsafe { _mm_sfence() };
 }
@@ -693,13 +724,21 @@ struct Sess {
     purch: bool,
 }
 
-pub struct UserRow {
-    pub person: u32,
-    pub day: i32,
-    pub sessions: u64,
-    pub events: u64,
-    pub revenue: u64,
-    pub top: Option<u32>,
+#[derive(Default)]
+pub struct Rows {
+    pub person: Vec<u32>,
+    pub day: Vec<i32>,
+    pub sessions: Vec<i64>,
+    pub events: Vec<i64>,
+    pub revenue: Vec<i64>,
+    pub top: Vec<u32>,
+}
+
+const ROW_STEP: usize = 1 << 17;
+
+fn extend<T>(v: &mut Vec<T>, n: usize) {
+    v.reserve_exact(n);
+    advise(unsafe { v.as_ptr().add(v.len()) }, v.capacity() - v.len(), MADV_POPULATE_WRITE);
 }
 
 struct Scratch {
@@ -719,7 +758,7 @@ struct DayAcc {
     revenue: u64,
 }
 
-fn flush_row(person: u32, d: &DayAcc, sc: &mut Scratch, rows: &mut Vec<UserRow>) {
+fn flush_row(person: u32, d: &DayAcc, sc: &mut Scratch, rows: &mut Rows) {
     let mut top: Option<u32> = None;
     let mut best = 0u64;
     for &c in &sc.touched {
@@ -731,7 +770,20 @@ fn flush_row(person: u32, d: &DayAcc, sc: &mut Scratch, rows: &mut Vec<UserRow>)
         sc.catsum[c as usize] = 0;
     }
     sc.touched.clear();
-    rows.push(UserRow { person, day: d.day, sessions: d.sessions, events: d.events, revenue: d.revenue, top });
+    if rows.person.len() == rows.person.capacity() {
+        extend(&mut rows.person, ROW_STEP);
+        extend(&mut rows.day, ROW_STEP);
+        extend(&mut rows.sessions, ROW_STEP);
+        extend(&mut rows.events, ROW_STEP);
+        extend(&mut rows.revenue, ROW_STEP);
+        extend(&mut rows.top, ROW_STEP);
+    }
+    rows.person.push(person);
+    rows.day.push(d.day);
+    rows.sessions.push(d.sessions as i64);
+    rows.events.push(d.events as i64);
+    rows.revenue.push(d.revenue as i64);
+    rows.top.push(top.unwrap_or(u32::MAX));
 }
 
 struct PersonCtx<'s, 'a> {
@@ -741,7 +793,7 @@ struct PersonCtx<'s, 'a> {
     organic: u32,
 }
 
-fn person(pid: u32, evs: &mut [u64], cks: &mut [u64], cx: &PersonCtx<'_, '_>, sc: &mut Scratch, rows: &mut Vec<UserRow>, acc: &mut Acc) {
+fn person(pid: u32, evs: &mut [u64], cks: &mut [u64], cx: &PersonCtx<'_, '_>, sc: &mut Scratch, rows: &mut Rows, acc: &mut Acc) {
     evs.sort_unstable();
     sc.sess.clear();
     let mut d = DayAcc { day: 0, sessions: 0, events: 0, revenue: 0 };
@@ -819,7 +871,7 @@ pub struct Worker<'a> {
     bf: ShardBufs<'a>,
     pub name_off: Vec<u32>,
     pub name_data: Vec<u8>,
-    pub rows: Vec<UserRow>,
+    pub rows: Rows,
     pub acc: Acc,
 }
 impl Worker<'_> {
@@ -829,7 +881,7 @@ impl Worker<'_> {
             bf: ShardBufs::default(),
             name_off: vec![0],
             name_data: Vec::new(),
-            rows: Vec::new(),
+            rows: Rows::default(),
             acc: Acc { day0, ndays, credit: vec![(0, 0, 0); ncamp * ndays], assist: vec![0; ncamp * ndays] },
         }
     }
@@ -857,6 +909,9 @@ pub fn run_shard<'a>(routed: &[Routed<'a>], parsed: &[Parsed], links: &LinkMap<'
     bf.tab.reset(n_ev, n_ev / 4);
     bf.keys.clear();
     bf.tmp.clear();
+    if bf.tmp.capacity() < n_ev {
+        extend(&mut bf.tmp, n_ev + n_ev / 4);
+    }
     bf.purch.clear();
     bf.off.clear();
     bf.off.push(0);

@@ -99,6 +99,7 @@ pub fn run(data_dir: &Path, out_dir: &Path, ncpu: usize) -> io::Result<()> {
     let links_slot: Mutex<Option<LinkMap>> = Mutex::new(None);
     let (_, mut parsed) = par_run(nl + ne, ncpu, || Parsed::new(nshard, huge), |st, i| {
         if i < nl {
+            prefault(lk_chunks[i]);
             let v = parse_links(lk_chunks[i]);
             *lk_parts[i].lock().unwrap() = v;
             if lk_done.fetch_add(1, Ordering::AcqRel) + 1 == nl {
@@ -107,6 +108,7 @@ pub fn run(data_dir: &Path, out_dir: &Path, ncpu: usize) -> io::Result<()> {
                 *links_slot.lock().unwrap() = Some(lm);
             }
         } else {
+            prefault(ev_chunks[i - nl]);
             parse_events(ev_chunks[i - nl], (i - nl) as u16, &ectx, st);
             release(ev_chunks[i - nl]);
         }
@@ -121,6 +123,7 @@ pub fn run(data_dir: &Path, out_dir: &Path, ncpu: usize) -> io::Result<()> {
         if i < nshard {
             dedup_route(&parsed, i, &links, nshard, st);
         } else {
+            prefault(ck_chunks[i - nshard]);
             parse_clicks(ck_chunks[i - nshard], &cctx, nshard, st);
         }
     });
@@ -203,21 +206,7 @@ const STREAM: pqw::Method = pqw::Method::Stream(1 << 20);
 
 fn write_users(path: &Path, w: &Worker, cat_names: &[B]) -> io::Result<()> {
     use pqw::*;
-    let n = w.rows.len();
-    let mut ukeys: Vec<u32> = Vec::with_capacity(n);
-    let mut day = Vec::with_capacity(n);
-    let mut s = Vec::with_capacity(n);
-    let mut ev = Vec::with_capacity(n);
-    let mut rev = Vec::with_capacity(n);
-    let mut top: Vec<u32> = Vec::with_capacity(n);
-    for r in &w.rows {
-        ukeys.push(r.person);
-        day.push(r.day);
-        s.push(r.sessions as i64);
-        ev.push(r.events as i64);
-        rev.push(r.revenue as i64);
-        top.push(r.top.unwrap_or(u32::MAX));
-    }
+    let r = &w.rows;
     let mut cats = StrBuf::new(cat_names.len(), 0);
     for c in cat_names {
         cats.push(c);
@@ -226,20 +215,20 @@ fn write_users(path: &Path, w: &Worker, cat_names: &[B]) -> io::Result<()> {
     let top8: Vec<u8>;
     let top16: Vec<u16>;
     let tkeys = if ncat < u8::MAX as usize {
-        top8 = top.iter().map(|&t| if t == u32::MAX { u8::MAX } else { t as u8 }).collect();
+        top8 = r.top.iter().map(|&t| if t == u32::MAX { u8::MAX } else { t as u8 }).collect();
         Keys::U8(&top8)
     } else if ncat < u16::MAX as usize {
-        top16 = top.iter().map(|&t| if t == u32::MAX { u16::MAX } else { t as u16 }).collect();
+        top16 = r.top.iter().map(|&t| if t == u32::MAX { u16::MAX } else { t as u16 }).collect();
         Keys::U16(&top16)
     } else {
-        Keys::U32(&top)
+        Keys::U32(&r.top)
     };
     let cols = [
-        Column { name: "user_id", data: Data::Dict { dict: StrCol { offsets: &w.name_off, data: &w.name_data }, keys: Keys::U32(&ukeys), nullable: false, plain: false } },
-        Column { name: "day", data: Data::Date(&day, IntEnc::Dense) },
-        Column { name: "sessions", data: Data::I64(&s, IntEnc::Auto) },
-        Column { name: "events", data: Data::I64(&ev, IntEnc::Auto) },
-        Column { name: "revenue_cents", data: Data::I64(&rev, IntEnc::Plain) },
+        Column { name: "user_id", data: Data::Dict { dict: StrCol { offsets: &w.name_off, data: &w.name_data }, keys: Keys::U32(&r.person), nullable: false, plain: false } },
+        Column { name: "day", data: Data::Date(&r.day, IntEnc::Dense) },
+        Column { name: "sessions", data: Data::I64(&r.sessions, IntEnc::Auto) },
+        Column { name: "events", data: Data::I64(&r.events, IntEnc::Auto) },
+        Column { name: "revenue_cents", data: Data::I64(&r.revenue, IntEnc::Plain) },
         Column { name: "top_category", data: Data::Dict { dict: cats.col(), keys: tkeys, nullable: true, plain: false } },
     ];
     write_file(path, &cols, &Opts::default(), STREAM)?;
