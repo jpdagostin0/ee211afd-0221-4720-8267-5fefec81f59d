@@ -1,5 +1,8 @@
 use super::parse::{count_lines, day_of, first, for_rows, parse_price, parse_ts, B, DAY_MS};
 use super::util::{mix, new_map, Map};
+use std::alloc::{alloc, handle_alloc_error, Layout};
+use std::arch::x86_64::*;
+use std::mem::MaybeUninit;
 
 const T_SHORT: u8 = 0;
 const T_LONG: u8 = 1;
@@ -15,16 +18,6 @@ const C: [u64; 8] = [
     0xe703_7ed1_a0b4_28db,
     0x8ebc_6af0_9c88_c6e3,
 ];
-
-const HEX: [u8; 256] = {
-    let mut t = [255u8; 256];
-    let mut i = 0;
-    while i < 16 {
-        t[b"0123456789abcdef"[i] as usize] = i as u8;
-        i += 1;
-    }
-    t
-};
 
 #[inline(always)]
 fn r64(b: &[u8], i: usize) -> u64 {
@@ -67,18 +60,29 @@ fn key_of(b: &[u8]) -> (u8, [u64; 2]) {
         return (T_SHORT, [lo, hi | ((n as u64) << 56)]);
     }
     if n == 33 && b[0] >= 0x21 {
-        let mut k = [0u64; 2];
-        let mut bad = 0u8;
-        for i in 0..32 {
-            let v = HEX[b[i + 1] as usize];
-            bad |= v;
-            k[i >> 4] = (k[i >> 4] << 4) | (v & 15) as u64;
-        }
-        if bad < 16 {
+        if let Some(k) = hex32(b[1..].try_into().unwrap()) {
             return (b[0], k);
         }
     }
     (T_LONG, fingerprint(b))
+}
+
+#[inline]
+fn hex32(b: &[u8; 32]) -> Option<[u64; 2]> {
+    unsafe {
+        let v = _mm256_loadu_si256(b.as_ptr() as *const __m256i);
+        let d = _mm256_sub_epi8(v, _mm256_set1_epi8(b'0' as i8));
+        let a = _mm256_sub_epi8(v, _mm256_set1_epi8(b'a' as i8));
+        let is_d = _mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(9)), d);
+        let is_a = _mm256_cmpeq_epi8(_mm256_min_epu8(a, _mm256_set1_epi8(5)), a);
+        if _mm256_movemask_epi8(_mm256_or_si256(is_d, is_a)) != -1 {
+            return None;
+        }
+        let nib = _mm256_blendv_epi8(_mm256_add_epi8(a, _mm256_set1_epi8(10)), d, is_d);
+        let pair = _mm256_maddubs_epi16(nib, _mm256_set1_epi16(0x0110));
+        let bytes = _mm256_packus_epi16(pair, pair);
+        Some([(_mm256_extract_epi64::<0>(bytes) as u64).swap_bytes(), (_mm256_extract_epi64::<2>(bytes) as u64).swap_bytes()])
+    }
 }
 
 #[inline]
@@ -93,62 +97,157 @@ fn shard_of(h: u64, nshard: usize) -> usize {
 
 #[inline(always)]
 fn prefetch<T>(p: &T) {
-    unsafe { std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(p as *const T as *const i8) }
+    unsafe { _mm_prefetch::<_MM_HINT_T0>(p as *const T as *const i8) }
 }
 
-const BLOCK: usize = 256;
-const SLAB: usize = 1024;
+const BLOCK: usize = 16 << 10;
+const SLAB: usize = 16 << 20;
+const STAGE: usize = 8;
 
-pub struct Bins<T> {
-    slabs: Vec<Vec<T>>,
-    free: usize,
-    cur: Vec<[*mut T; 2]>,
-    blocks: Vec<Vec<*const T>>,
+extern "C" {
+    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+}
+
+const MADV_DONTNEED: i32 = 4;
+const MADV_HUGEPAGE: i32 = 14;
+const MADV_POPULATE_WRITE: i32 = 23;
+
+fn advise<T>(p: *const T, n: usize, advice: i32) {
+    let a = (p as usize + 4095) & !4095;
+    let e = (p as usize + n * std::mem::size_of::<T>()) & !4095;
+    if e > a {
+        unsafe { madvise(a as *mut u8, e - a, advice) };
+    }
+}
+
+pub fn release(c: B<'_>) {
+    advise(c.as_ptr(), c.len(), MADV_DONTNEED);
+}
+
+pub fn huge_pages(need: usize) -> bool {
+    let free: usize = std::fs::read_to_string("/proc/buddyinfo")
+        .unwrap_or_default()
+        .lines()
+        .flat_map(|l| l.split_ascii_whitespace().skip(4).enumerate().skip(9).map(|(o, n)| n.parse::<usize>().unwrap_or(0) << (12 + o)))
+        .sum();
+    free >= need
+}
+
+struct Arena {
+    slabs: Vec<*mut u8>,
+    used: usize,
+    pool: Vec<*mut u8>,
+    huge: bool,
+}
+unsafe impl Send for Arena {}
+unsafe impl Sync for Arena {}
+
+impl Arena {
+    fn new(huge: bool) -> Self {
+        Arena { slabs: Vec::new(), used: 0, pool: Vec::new(), huge }
+    }
+    fn release(self) {
+        for &slab in &self.slabs {
+            advise(slab, SLAB, MADV_DONTNEED);
+        }
+    }
+    fn block(&mut self) -> *mut u8 {
+        if let Some(p) = self.pool.pop() {
+            return p;
+        }
+        if self.used % SLAB == 0 {
+            let layout = Layout::from_size_align(SLAB, 2 << 20).unwrap();
+            let slab = unsafe { alloc(layout) };
+            if slab.is_null() {
+                handle_alloc_error(layout);
+            }
+            if self.huge {
+                advise(slab, SLAB, MADV_HUGEPAGE);
+            }
+            self.slabs.push(slab);
+            self.used = 0;
+        }
+        let p = unsafe { self.slabs[self.slabs.len() - 1].add(self.used) };
+        if self.used % (2 << 20) == 0 {
+            unsafe { madvise(p, 2 << 20, MADV_POPULATE_WRITE) };
+        }
+        self.used += BLOCK;
+        p
+    }
+}
+
+struct Bin<T> {
+    at: *mut T,
+    end: *mut T,
+    staged: usize,
+    blocks: Vec<*mut T>,
+}
+
+struct Bins<T> {
+    bins: Vec<Bin<T>>,
+    stage: Vec<MaybeUninit<T>>,
 }
 unsafe impl<T: Send> Send for Bins<T> {}
 unsafe impl<T: Sync> Sync for Bins<T> {}
 
 impl<T: Copy> Bins<T> {
+    const PER: usize = BLOCK / std::mem::size_of::<T>() / STAGE * STAGE;
+
     fn new(n: usize) -> Self {
-        Bins { slabs: Vec::new(), free: 0, cur: vec![[std::ptr::null_mut(); 2]; n], blocks: (0..n).map(|_| Vec::new()).collect() }
+        let mut stage: Vec<MaybeUninit<T>> = Vec::new();
+        stage.resize_with(n * STAGE, MaybeUninit::uninit);
+        Bins { bins: (0..n).map(|_| Bin { at: std::ptr::null_mut(), end: std::ptr::null_mut(), staged: 0, blocks: Vec::new() }).collect(), stage }
     }
     #[inline]
-    fn push(&mut self, s: usize, x: T) {
-        if self.cur[s][0] == self.cur[s][1] {
-            self.grow(s);
-        }
-        let c = &mut self.cur[s];
-        unsafe {
-            c[0].write(x);
-            c[0] = c[0].add(1);
+    fn push(&mut self, arena: &mut Arena, s: usize, x: T) {
+        let b = &mut self.bins[s];
+        self.stage[s * STAGE + b.staged].write(x);
+        b.staged += 1;
+        if b.staged == STAGE {
+            if b.at == b.end {
+                b.at = arena.block() as *mut T;
+                b.end = unsafe { b.at.add(Self::PER) };
+                b.blocks.push(b.at);
+            }
+            let src = self.stage[s * STAGE..].as_ptr() as *const __m256i;
+            for i in 0..STAGE * std::mem::size_of::<T>() / 32 {
+                unsafe { _mm256_stream_si256((b.at as *mut __m256i).add(i), _mm256_loadu_si256(src.add(i))) };
+            }
+            b.at = unsafe { b.at.add(STAGE) };
+            b.staged = 0;
         }
     }
-    #[cold]
-    #[inline(never)]
-    fn grow(&mut self, s: usize) {
-        if self.free == 0 {
-            self.slabs.push(Vec::with_capacity(BLOCK * SLAB));
-            self.free = SLAB;
+    fn finish(&mut self, arena: &mut Arena) {
+        for (s, b) in self.bins.iter_mut().enumerate() {
+            if b.staged == 0 {
+                continue;
+            }
+            if b.at == b.end {
+                b.at = arena.block() as *mut T;
+                b.end = unsafe { b.at.add(Self::PER) };
+                b.blocks.push(b.at);
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.stage[s * STAGE..].as_ptr() as *const T, b.at, b.staged);
+                b.at = b.at.add(b.staged);
+            }
+            b.staged = 0;
         }
-        let slab: &mut Vec<T> = self.slabs.last_mut().unwrap();
-        let p: *mut T = unsafe { slab.as_mut_ptr().add((SLAB - self.free) * BLOCK) };
-        self.free -= 1;
-        self.blocks[s].push(p);
-        self.cur[s] = [p, unsafe { p.add(BLOCK) }];
     }
     fn len(&self, s: usize) -> usize {
-        match self.blocks[s].last() {
-            Some(&p) => (self.blocks[s].len() - 1) * BLOCK + unsafe { self.cur[s][0].offset_from(p) } as usize,
+        let b = &self.bins[s];
+        match b.blocks.last() {
+            Some(&p) => (b.blocks.len() - 1) * Self::PER + unsafe { b.at.offset_from(p) } as usize,
             None => 0,
         }
     }
     fn blocks(&self, s: usize) -> impl Iterator<Item = &[T]> {
-        let b = &self.blocks[s];
-        let last = self.len(s) - b.len().saturating_sub(1) * BLOCK;
-        b.iter().enumerate().map(move |(j, &p)| unsafe { std::slice::from_raw_parts(p, if j + 1 == b.len() { last } else { BLOCK }) })
+        let b = &self.bins[s].blocks;
+        let last = self.len(s) - b.len().saturating_sub(1) * Self::PER;
+        b.iter().enumerate().map(move |(j, &p)| unsafe { std::slice::from_raw_parts(p, if j + 1 == b.len() { last } else { Self::PER }) })
     }
     fn get(&self, s: usize, i: usize) -> &T {
-        unsafe { &*self.blocks[s][i / BLOCK].add(i % BLOCK) }
+        unsafe { &*self.bins[s].blocks[i / Self::PER].add(i % Self::PER) }
     }
 }
 
@@ -158,10 +257,10 @@ struct Tab32 {
     bits: u32,
 }
 impl Tab32 {
-    fn reset(&mut self, n: usize) {
+    fn reset(&mut self, n: usize, slots: usize) {
         self.bits = usize::BITS - n.leading_zeros();
         self.slots.clear();
-        self.slots.resize((2 * n).next_power_of_two().max(16), 0);
+        self.slots.resize(slots.next_power_of_two().max(16), 0);
     }
     #[inline]
     fn find(&self, h: u64, mut eq: impl FnMut(u32) -> bool) -> Result<(usize, u32), usize> {
@@ -210,6 +309,9 @@ pub struct LinkMap<'a> {
 }
 
 impl LinkMap<'_> {
+    pub fn release(self) {
+        advise(self.slots.as_ptr(), self.slots.len(), MADV_DONTNEED);
+    }
     #[inline]
     fn prefetch(&self, h: u64) {
         prefetch(&self.slots[h as usize & (self.slots.len() - 1)]);
@@ -259,10 +361,14 @@ pub fn parse_links(c: B<'_>) -> LinkPart<'_> {
     v
 }
 
-pub fn build_links<'a>(parts: &[LinkPart<'a>]) -> LinkMap<'a> {
+pub fn build_links<'a>(parts: &[LinkPart<'a>], huge: bool) -> LinkMap<'a> {
     let n: usize = parts.iter().map(|p| p.len()).sum();
     let mask = (4 * n).next_power_of_two().max(16) - 1;
-    let mut slots = vec![Slot { k: [0; 2], tag: 0, name: 0 }; mask + 1];
+    let mut slots: Vec<Slot> = Vec::with_capacity(mask + 1);
+    if huge {
+        advise(slots.as_ptr(), mask + 1, MADV_HUGEPAGE);
+    }
+    slots.resize(mask + 1, Slot { k: [0; 2], tag: 0, name: 0 });
     let mut ids: Vec<B<'a>> = Vec::with_capacity(n + n / 2);
     let mut parent: Vec<u32> = Vec::with_capacity(n + n / 2);
     for p in parts {
@@ -349,14 +455,20 @@ pub struct Ck<'a> {
     tag: u8,
 }
 
-pub struct Parsed<'a> {
+pub struct Parsed {
+    arena: Arena,
     ev: Bins<Ev>,
-    pub ck: Vec<Ck<'a>>,
-    pub side: Vec<Vec<u8>>,
+    side: Vec<Vec<u8>>,
 }
-impl Parsed<'_> {
-    pub fn new(nshard: usize) -> Self {
-        Parsed { ev: Bins::new(nshard), ck: Vec::new(), side: vec![Vec::new(); nshard] }
+impl Parsed {
+    pub fn finish(&mut self) {
+        self.ev.finish(&mut self.arena);
+    }
+    pub fn release(self) {
+        self.arena.release();
+    }
+    pub fn new(nshard: usize, huge: bool) -> Self {
+        Parsed { arena: Arena::new(huge), ev: Bins::new(nshard), side: vec![Vec::new(); nshard] }
     }
 }
 
@@ -368,7 +480,7 @@ pub struct EvCtx<'m, 'a> {
     pub unknown_cat: u32,
 }
 
-pub fn parse_events(c: B<'_>, chunk: u16, ctx: &EvCtx<'_, '_>, out: &mut Parsed<'_>) {
+pub fn parse_events(c: B<'_>, chunk: u16, ctx: &EvCtx<'_, '_>, out: &mut Parsed) {
     let nshard = out.side.len();
     for_rows(c, |_, [eid, user, ts, ingest, typ, product, price]: [B; 7]| {
         if eid.is_empty() {
@@ -411,25 +523,35 @@ pub fn parse_events(c: B<'_>, chunk: u16, ctx: &EvCtx<'_, '_>, out: &mut Parsed<
             e.ts = (t - ctx.lo) as u32;
             e.pt = pr | (ty << 24);
         }
-        out.ev.push(shard_of(khash(etag, ek), nshard), e);
+        out.ev.push(&mut out.arena, shard_of(khash(etag, ek), nshard), e);
     });
+    unsafe { _mm_sfence() };
 }
 
 pub struct Routed<'a> {
+    arena: Arena,
     rec: Bins<Rec>,
     ck: Bins<Ck<'a>>,
     tab: Tab32,
     lose: Vec<u32>,
+    pend: Vec<Ck<'a>>,
 }
 impl Routed<'_> {
-    pub fn new(nshard: usize) -> Self {
-        Routed { rec: Bins::new(nshard), ck: Bins::new(nshard), tab: Tab32::default(), lose: Vec::new() }
+    pub fn finish(&mut self) {
+        self.rec.finish(&mut self.arena);
+        self.ck.finish(&mut self.arena);
+    }
+    pub fn release(self) {
+        self.arena.release();
+    }
+    pub fn new(nshard: usize, huge: bool) -> Self {
+        Routed { arena: Arena::new(huge), rec: Bins::new(nshard), ck: Bins::new(nshard), tab: Tab32::default(), lose: Vec::new(), pend: Vec::with_capacity(BATCH) }
     }
 }
 
 const BATCH: usize = 32;
 
-pub fn dedup_route(parsed: &[Parsed<'_>], s: usize, links: &LinkMap<'_>, nshard: usize, out: &mut Routed<'_>) {
+pub fn dedup_route(parsed: &[Parsed], s: usize, links: &LinkMap<'_>, nshard: usize, out: &mut Routed<'_>) {
     let total: usize = parsed.iter().map(|p| p.ev.len(s)).sum();
     let at = |mut i: usize| -> &Ev {
         for p in parsed {
@@ -441,7 +563,7 @@ pub fn dedup_route(parsed: &[Parsed<'_>], s: usize, links: &LinkMap<'_>, nshard:
         }
         unreachable!()
     };
-    out.tab.reset(total);
+    out.tab.reset(total, 2 * total);
     out.lose.clear();
     let mut flat = 0u32;
     for p in parsed {
@@ -494,55 +616,74 @@ pub fn dedup_route(parsed: &[Parsed<'_>], s: usize, links: &LinkMap<'_>, nshard:
                     let e = &sub[i];
                     let (tag, k) = links.person(e.utag, e.user, hs[i]);
                     let h = if tag == T_LINK { khash(tag, k) } else { hs[i] };
-                    out.rec.push(shard_of(h, nshard), Rec { k, ts: e.ts, pt: e.pt, cat: e.cat, tag });
+                    out.rec.push(&mut out.arena, shard_of(h, nshard), Rec { k, ts: e.ts, pt: e.pt, cat: e.cat, tag });
                 }
             }
         }
     }
+    for p in parsed {
+        out.arena.pool.extend(p.ev.bins[s].blocks.iter().map(|&b| b as *mut u8));
+    }
+    unsafe { _mm_sfence() };
 }
 
-pub fn parse_clicks<'a>(c: B<'a>, lo: i64, we: i64, campaigns: &Map<B<'_>, u32>, out: &mut Vec<Ck<'a>>) {
+pub struct CkCtx<'m, 'a> {
+    pub lo: i64,
+    pub we: i64,
+    pub campaigns: &'m Map<B<'a>, u32>,
+    pub links: &'m LinkMap<'a>,
+}
+
+pub fn parse_clicks<'a>(c: B<'a>, ctx: &CkCtx<'_, '_>, nshard: usize, out: &mut Routed<'a>) {
+    let Routed { arena, ck, pend, .. } = out;
     for_rows(c, |line, [cid, user, camp, ts]: [B; 4]| {
         if cid.is_empty() || user.is_empty() {
             return;
         }
         let Some(t) = parse_ts(ts) else { return };
-        if t < lo || t >= we {
+        if t < ctx.lo || t >= ctx.we {
             return;
         }
-        let Some(&camp) = campaigns.get(camp) else { return };
+        let Some(&camp) = ctx.campaigns.get(camp) else { return };
         let (tag, k) = key_of(user);
-        out.push(Ck { k, line: line, ts: (t - lo) as u32, camp, tag });
+        pend.push(Ck { k, line, ts: (t - ctx.lo) as u32, camp, tag });
+        if pend.len() == BATCH {
+            route_clicks(pend, ctx.links, nshard, arena, ck);
+        }
     });
+    route_clicks(pend, ctx.links, nshard, arena, ck);
+    unsafe { _mm_sfence() };
 }
 
-pub fn route_clicks<'a>(v: &[Ck<'a>], links: &LinkMap<'_>, nshard: usize, out: &mut Routed<'a>) {
+fn route_clicks<'a>(pend: &mut Vec<Ck<'a>>, links: &LinkMap<'_>, nshard: usize, arena: &mut Arena, out: &mut Bins<Ck<'a>>) {
     let mut hs = [0u64; BATCH];
-    for sub in v.chunks(BATCH) {
-        for (i, c) in sub.iter().enumerate() {
-            hs[i] = khash(c.tag, c.k);
-            links.prefetch(hs[i]);
-        }
-        for (i, c) in sub.iter().enumerate() {
-            let (tag, k) = links.person(c.tag, c.k, hs[i]);
-            let h = if tag == T_LINK { khash(tag, k) } else { hs[i] };
-            out.ck.push(shard_of(h, nshard), Ck { k, tag, ..*c });
-        }
+    for (i, c) in pend.iter().enumerate() {
+        hs[i] = khash(c.tag, c.k);
+        links.prefetch(hs[i]);
     }
+    for (i, c) in pend.iter().enumerate() {
+        let (tag, k) = links.person(c.tag, c.k, hs[i]);
+        let h = if tag == T_LINK { khash(tag, k) } else { hs[i] };
+        out.push(arena, shard_of(h, nshard), Ck { k, tag, ..*c });
+    }
+    pend.clear();
 }
 
 
 pub const GAP_MS: i64 = 1_800_000;
 pub const WEEK_MS: i64 = 7 * 86_400_000;
 
-pub type Acc = Map<u64, [u64; 4]>;
-
-#[inline]
-pub fn key(camp: u32, day: i32) -> u64 {
-    ((camp as u64) << 32) | (day as u32 as u64)
+pub struct Acc {
+    day0: i32,
+    ndays: usize,
+    pub credit: Vec<(u32, u32, u64)>,
+    pub assist: Vec<u32>,
 }
-pub fn unkey(k: u64) -> (u32, i32) {
-    ((k >> 32) as u32, k as u32 as i32)
+impl Acc {
+    #[inline]
+    fn cell(&self, camp: u32, day: i32) -> usize {
+        camp as usize * self.ndays + (day - self.day0) as usize
+    }
 }
 
 struct Sess {
@@ -569,7 +710,6 @@ struct Scratch {
     catsum: Vec<u64>,
     touched: Vec<u32>,
     ct: Vec<(u32, i64)>,
-    win: Vec<u32>,
 }
 
 struct DayAcc {
@@ -637,22 +777,7 @@ fn person(pid: u32, evs: &mut [u64], cks: &mut [u64], cx: &PersonCtx<'_, '_>, sc
     flush_row(pid, &d, sc, rows);
 
     cks.sort_unstable();
-    sc.win.clear();
-    let mut i = 0;
-    while i < cks.len() {
-        let mut best = cx.cl[cks[i] as u32 as usize];
-        let mut j = i + 1;
-        while j < cks.len() && cks[j] >> 32 == cks[i] >> 32 {
-            let c = cx.cl[cks[j] as u32 as usize];
-            if unsafe { first(c.1) < first(best.1) } {
-                best = c;
-            }
-            j += 1;
-        }
-        sc.win.resize(j, best.0);
-        i = j;
-    }
-    credit(&sc.sess, cks, &sc.win, cx.organic, acc);
+    credit(&sc.sess, cks, cx, acc);
     if !cks.is_empty() {
         sc.starts.clear();
         sc.days.clear();
@@ -698,14 +823,14 @@ pub struct Worker<'a> {
     pub acc: Acc,
 }
 impl Worker<'_> {
-    pub fn new(ncat: usize) -> Self {
+    pub fn new(ncat: usize, ncamp: usize, day0: i32, ndays: usize) -> Self {
         Worker {
-            sc: Scratch { sess: vec![], starts: vec![], days: vec![], day_end: vec![], catsum: vec![0; ncat], touched: vec![], ct: vec![], win: vec![] },
+            sc: Scratch { sess: vec![], starts: vec![], days: vec![], day_end: vec![], catsum: vec![0; ncat], touched: vec![], ct: vec![] },
             bf: ShardBufs::default(),
             name_off: vec![0],
             name_data: Vec::new(),
             rows: Vec::new(),
-            acc: Acc::default(),
+            acc: Acc { day0, ndays, credit: vec![(0, 0, 0); ncamp * ndays], assist: vec![0; ncamp * ndays] },
         }
     }
 }
@@ -726,10 +851,10 @@ fn group(tmp: &[(u32, u64)], off: &mut [u32], pos: &mut Vec<u32>, out: &mut Vec<
     }
 }
 
-pub fn run_shard<'a>(routed: &[Routed<'a>], sides: &[Vec<Vec<u8>>], links: &LinkMap<'_>, p: usize, lo: i64, organic: u32, w: &mut Worker<'a>) {
+pub fn run_shard<'a>(routed: &[Routed<'a>], parsed: &[Parsed], links: &LinkMap<'_>, p: usize, lo: i64, organic: u32, w: &mut Worker<'a>) {
     let Worker { sc, bf, name_off, name_data, rows, acc } = w;
     let n_ev: usize = routed.iter().map(|r| r.rec.len(p)).sum();
-    bf.tab.reset(n_ev);
+    bf.tab.reset(n_ev, n_ev / 4);
     bf.keys.clear();
     bf.tmp.clear();
     bf.purch.clear();
@@ -743,9 +868,20 @@ pub fn run_shard<'a>(routed: &[Routed<'a>], sides: &[Vec<Vec<u8>>], links: &Link
                     Ok((_, i)) => i,
                     Err(slot) => {
                         let i = bf.keys.len() as u32;
+                        if e.tag == T_LINK {
+                            prefetch(&links.ids[e.k[0] as usize]);
+                        }
                         bf.keys.push((e.tag, e.k));
                         bf.off.push(0);
                         bf.tab.set(slot, h, i);
+                        if bf.keys.len() * 2 > bf.tab.slots.len() {
+                            bf.tab.reset(n_ev, bf.keys.len() * 4);
+                            for (j, &(tag, k)) in bf.keys.iter().enumerate() {
+                                let h = khash(tag, k);
+                                let slot = bf.tab.find(h, |_| false).unwrap_err();
+                                bf.tab.set(slot, h, j as u32);
+                            }
+                        }
                         i
                     }
                 };
@@ -760,6 +896,11 @@ pub fn run_shard<'a>(routed: &[Routed<'a>], sides: &[Vec<Vec<u8>>], links: &Link
         }
     }
     let np = bf.keys.len();
+    for &(tag, k) in &bf.keys {
+        if tag == T_LINK {
+            prefetch(&links.ids[k[0] as usize][0]);
+        }
+    }
     group(&bf.tmp, &mut bf.off, &mut bf.pos, &mut bf.pe);
     bf.tmp.clear();
     bf.cl.clear();
@@ -791,8 +932,8 @@ pub fn run_shard<'a>(routed: &[Routed<'a>], sides: &[Vec<Vec<u8>>], links: &Link
             T_LONG => {
                 let m = side.get_or_insert_with(|| {
                     let mut m = new_map(0);
-                    for t in sides {
-                        let mut b = &t[p][..];
+                    for t in parsed {
+                        let mut b = &t.side[p][..];
                         while !b.is_empty() {
                             let n = r32(b, 16) as usize;
                             m.insert((r64(b, 0), r64(b, 8)), &b[20..20 + n]);
@@ -820,21 +961,43 @@ pub fn run_shard<'a>(routed: &[Routed<'a>], sides: &[Vec<Vec<u8>>], links: &Link
 }
 
 
-fn credit(sess: &[Sess], cks: &[u64], win: &[u32], organic: u32, acc: &mut Acc) {
+fn credit(sess: &[Sess], cks: &[u64], cx: &PersonCtx<'_, '_>, acc: &mut Acc) {
     let n = cks.len();
     let (mut lo, mut hi) = (0usize, 0usize);
+    let mut camp = cx.organic;
     for s in sess {
+        let h0 = hi;
         while hi < n && (cks[hi] >> 32) as i64 <= s.start {
             hi += 1;
         }
         while lo < hi && ((cks[lo] >> 32) as i64) < s.start - WEEK_MS {
             lo += 1;
         }
-        let camp = if hi > lo { win[hi - 1] } else { organic };
-        let a = acc.entry(key(camp, s.day)).or_default();
-        a[0] += 1;
-        a[1] += s.purch as u64;
-        a[2] += s.rev;
+        if hi == lo {
+            camp = cx.organic;
+        } else if hi != h0 {
+            let mut best = cx.cl[cks[hi - 1] as u32 as usize];
+            let mut i = hi - 1;
+            let mut mixed = false;
+            while i > lo && cks[i - 1] >> 32 == cks[hi - 1] >> 32 {
+                i -= 1;
+                mixed |= cx.cl[cks[i] as u32 as usize].0 != best.0;
+            }
+            if mixed {
+                for &c in &cks[i..hi - 1] {
+                    let c = cx.cl[c as u32 as usize];
+                    if unsafe { first(c.1) < first(best.1) } {
+                        best = c;
+                    }
+                }
+            }
+            camp = best.0;
+        }
+        let c = acc.cell(camp, s.day);
+        let a = &mut acc.credit[c];
+        a.0 += 1;
+        a.1 += s.purch as u32;
+        a.2 += s.rev;
     }
 }
 
@@ -846,7 +1009,8 @@ fn assists(starts: &[i64], days: &[i32], day_end: &[u32], ct: &[(u32, i64)], acc
         let mut k = lo;
         while k < hi {
             let e = (day_end[k] as usize).min(hi);
-            acc.entry(key(camp, days[k])).or_insert([0; 4])[3] += (e - k) as u64;
+            let c = acc.cell(camp, days[k]);
+            acc.assist[c] += (e - k) as u32;
             k = e;
         }
     };

@@ -12,7 +12,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 const SHARD_BYTES: usize = 4 << 20;
-const CK_TASK: usize = 1 << 16;
 
 fn take<T: Default>(m: &Mutex<T>) -> T {
     std::mem::take(&mut *m.lock().unwrap_or_else(|e| e.into_inner()))
@@ -90,6 +89,7 @@ pub fn run(data_dir: &Path, out_dir: &Path, ncpu: usize) -> io::Result<()> {
     }
     let ev_bytes: usize = ev_files.iter().map(|f| f.len()).sum();
     let nshard = (ev_bytes / SHARD_BYTES).next_power_of_two().min(4096);
+    let huge = huge_pages(ev_bytes);
     lap("setup");
 
     let ectx = EvCtx { lo, ws, we, products: &products, unknown_cat };
@@ -97,53 +97,43 @@ pub fn run(data_dir: &Path, out_dir: &Path, ncpu: usize) -> io::Result<()> {
     let lk_parts: Vec<Mutex<LinkPart>> = (0..nl).map(|_| Mutex::new(Vec::new())).collect();
     let lk_done = AtomicUsize::new(0);
     let links_slot: Mutex<Option<LinkMap>> = Mutex::new(None);
-    let (_, parsed) = par_run(nl + ne + nc, ncpu, || Parsed::new(nshard), |st, i| {
+    let (_, mut parsed) = par_run(nl + ne, ncpu, || Parsed::new(nshard, huge), |st, i| {
         if i < nl {
             let v = parse_links(lk_chunks[i]);
             *lk_parts[i].lock().unwrap() = v;
             if lk_done.fetch_add(1, Ordering::AcqRel) + 1 == nl {
                 let parts: Vec<LinkPart> = lk_parts.iter().map(take).collect();
-                let lm = build_links(&parts);
+                let lm = build_links(&parts, huge);
                 *links_slot.lock().unwrap() = Some(lm);
             }
-        } else if i < nl + ne {
-            parse_events(ev_chunks[i - nl], (i - nl) as u16, &ectx, st);
         } else {
-            parse_clicks(ck_chunks[i - nl - ne], lo, we, &campaigns, &mut st.ck);
+            parse_events(ev_chunks[i - nl], (i - nl) as u16, &ectx, st);
+            release(ev_chunks[i - nl]);
         }
     });
-    let links = links_slot.into_inner().unwrap().unwrap_or_else(|| build_links(&[]));
+    parsed.iter_mut().for_each(Parsed::finish);
+    let links = links_slot.into_inner().unwrap().unwrap_or_else(|| build_links(&[], huge));
     drop(lk_parts);
-    drop(evm);
     lap("parse+links");
 
-    let ck_tasks: Vec<(usize, usize)> = parsed.iter().enumerate().flat_map(|(t, p)| (0..p.ck.len()).step_by(CK_TASK).map(move |o| (t, o))).collect();
-    let (_, routed) = par_run(nshard + ck_tasks.len(), ncpu, || Routed::new(nshard), |st, i| {
+    let cctx = CkCtx { lo, we, campaigns: &campaigns, links: &links };
+    let (_, mut routed) = par_run(nshard + nc, ncpu, || Routed::new(nshard, huge), |st, i| {
         if i < nshard {
             dedup_route(&parsed, i, &links, nshard, st);
         } else {
-            let (t, o) = ck_tasks[i - nshard];
-            let v = &parsed[t].ck;
-            route_clicks(&v[o..(o + CK_TASK).min(v.len())], &links, nshard, st);
+            parse_clicks(ck_chunks[i - nshard], &cctx, nshard, st);
         }
     });
-    let sides: Vec<Vec<Vec<u8>>> = parsed.into_iter().map(|p| p.side).collect();
+    routed.iter_mut().for_each(Routed::finish);
     lap("dedup+route");
 
-    let ncat = cat_names.len();
-    let (_, mut workers) = par_run(nshard, ncpu, || Worker::new(ncat), |w, p| run_shard(&routed, &sides, &links, p, lo, organic, w));
-    let mut acc: Acc = Acc::default();
-    for w in &mut workers {
-        let a = std::mem::take(&mut w.acc);
-        if acc.is_empty() {
-            acc = a;
-            continue;
-        }
-        for (k, v) in a {
-            let e = acc.entry(k).or_insert([0; 4]);
-            for i in 0..4 {
-                e[i] += v[i];
-            }
+    let day0 = parse::day_of(ws);
+    let ndays = (parse::day_of(we - 1) - day0 + 1).max(1) as usize;
+    let (_, workers) = par_run(nshard, ncpu, || Worker::new(cat_names.len(), camp_ids.len(), day0, ndays), |w, p| run_shard(&routed, &parsed, &links, p, lo, organic, w));
+    let mut cells: Vec<[u64; 4]> = vec![[0; 4]; camp_ids.len() * ndays];
+    for w in &workers {
+        for ((c, v), a) in cells.iter_mut().zip(&w.acc.credit).zip(&w.acc.assist) {
+            *c = [c[0] + v.0 as u64, c[1] + v.1 as u64, c[2] + v.2, c[3] + *a as u64];
         }
     }
     lap("sessions");
@@ -153,20 +143,28 @@ pub fn run(data_dir: &Path, out_dir: &Path, ncpu: usize) -> io::Result<()> {
     std::fs::create_dir_all(&cd)?;
     clear_parquet(&ud)?;
     clear_parquet(&cd)?;
-    let nparts = workers.len();
-    let (res, _) = par_run(nparts + 1, ncpu, || (), |_, k| {
-        if k == nparts {
-            write_campaigns(&cd.join("part-0.parquet"), &acc, &camp_ids, &channels)
-        } else {
-            write_users(&ud.join(format!("part-{k}.parquet")), &workers[k], &cat_names)
-        }
-    });
+    let mut jobs: Vec<Box<dyn FnOnce() -> io::Result<()> + Send + '_>> = Vec::new();
+    for (k, w) in workers.iter().enumerate() {
+        let (ud, cat_names) = (&ud, &cat_names);
+        jobs.push(Box::new(move || write_users(&ud.join(format!("part-{k}.parquet")), w, cat_names)));
+    }
+    jobs.push(Box::new(|| write_campaigns(&cd.join("part-0.parquet"), &cells, day0, ndays, &camp_ids, &channels)));
+    jobs.push(Box::new(move || Ok(links.release())));
+    for r in routed {
+        jobs.push(Box::new(move || Ok(r.release())));
+    }
+    for p in parsed {
+        jobs.push(Box::new(move || Ok(p.release())));
+    }
+    let jobs: Vec<Mutex<Option<Box<dyn FnOnce() -> io::Result<()> + Send + '_>>>> = jobs.into_iter().map(|j| Mutex::new(Some(j))).collect();
+    let (res, _) = par_run(jobs.len(), ncpu, || (), |_, k| take(&jobs[k]).unwrap()());
+    drop(jobs);
     for r in res {
         r?;
     }
     lap("write");
     drop(workers);
-    drop(acc);
+    drop(cells);
     lap("free");
     Ok(())
 }
@@ -248,9 +246,9 @@ fn write_users(path: &Path, w: &Worker, cat_names: &[B]) -> io::Result<()> {
     Ok(())
 }
 
-fn write_campaigns(path: &Path, acc: &Acc, camp_ids: &[B], channels: &[B]) -> io::Result<()> {
+fn write_campaigns(path: &Path, cells: &[[u64; 4]], day0: i32, ndays: usize, camp_ids: &[B], channels: &[B]) -> io::Result<()> {
     use pqw::*;
-    let n = acc.len();
+    let n = cells.iter().filter(|v| **v != [0; 4]).count();
     let mut cid = StrBuf::new(n, n * 8);
     let mut ch = StrBuf::new(n, n * 8);
     let mut day = Vec::with_capacity(n);
@@ -258,11 +256,13 @@ fn write_campaigns(path: &Path, acc: &Acc, camp_ids: &[B], channels: &[B]) -> io
     let mut ps = Vec::with_capacity(n);
     let mut rev = Vec::with_capacity(n);
     let mut asst = Vec::with_capacity(n);
-    for (&key, v) in acc {
-        let (c, d) = unkey(key);
-        cid.push(camp_ids[c as usize]);
-        ch.push(channels[c as usize]);
-        day.push(d);
+    for (i, v) in cells.iter().enumerate() {
+        if *v == [0; 4] {
+            continue;
+        }
+        cid.push(camp_ids[i / ndays]);
+        ch.push(channels[i / ndays]);
+        day.push(day0 + (i % ndays) as i32);
         s.push(v[0] as i64);
         ps.push(v[1] as i64);
         rev.push(v[2] as i64);

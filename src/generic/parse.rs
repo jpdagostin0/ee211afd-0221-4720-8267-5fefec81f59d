@@ -1,4 +1,5 @@
 use super::util::{count_byte, eq_mask64, find_byte, find_sub};
+use std::arch::x86_64::{_pdep_u64, _pext_u32, _pext_u64};
 use std::cell::Cell;
 use std::io;
 
@@ -109,63 +110,107 @@ pub fn split<'a, const N: usize>(line: B<'a>) -> Option<[B<'a>; N]> {
     Some(out)
 }
 
+const ROW_BUF: usize = 256;
+
 #[inline]
 pub fn for_rows<'a, const N: usize>(chunk: B<'a>, mut f: impl FnMut(&'a u8, [B<'a>; N])) {
+    const { assert!(N >= 1 && N <= 8) };
     let n = chunk.len();
-    let mut ends = [0usize; N];
-    let mut k = 0usize;
-    let mut line = 0usize;
-    let mut after_sep = 1u64;
-    let mut after_inner = 0u64;
-    let mut stray_before = false;
+    let care = (!0u64 >> (64 - 8 * N)) & 0x0303_0303_0303_0303;
+    let want = 1u64 << (8 * (N - 1));
+    let mut pos = [usize::MAX; ROW_BUF + 80];
+    let mut flags = [0u8; ROW_BUF + 80];
+    let mut cnt = 1usize;
+    let mut tail = [0u8; 64];
     let mut base = 0usize;
-    while base + 64 <= n {
-        let blk = &chunk[base..];
-        let nl = eq_mask64(blk, b'\n');
-        let sep = nl | eq_mask64(blk, b',');
-        let inner = eq_mask64(blk, b'"') & !(sep << 1 | after_sep);
-        let mut stray = (inner << 1 | after_inner) & !sep;
-        after_sep = sep >> 63;
-        after_inner = inner >> 63;
-        let mut m = sep;
-        while m != 0 {
-            let bit = m & m.wrapping_neg();
-            let p = base + m.trailing_zeros() as usize;
-            ends[k.min(N - 1)] = p;
-            k += 1;
-            if nl & bit != 0 {
-                let clean = stray & (bit - 1) == 0 && !stray_before;
-                stray &= !(bit - 1);
-                stray_before = false;
-                if k == N && clean && p > line {
-                    let mut out: [B<'a>; N] = [&[]; N];
-                    let mut s = line;
-                    let mut ok = true;
-                    for i in 0..N {
-                        let e = ends[i];
-                        let o = (chunk[s] == b'"') as usize;
-                        let c = (chunk[e - (e > s) as usize] == b'"') as usize;
-                        ok &= o == c && e - s >= o + c;
-                        out[i] = unsafe { chunk.get_unchecked(s + o..(e - c).max(s + o)) };
-                        s = e + 1;
-                    }
-                    if ok {
-                        f(&chunk[line], out);
-                    }
+    let mut after_sep = 1u64;
+    let mut after_nl = 1u64;
+    let mut after_inner = 0u64;
+    let mut open_carry = 0u64;
+    let mut stray_carry = 0u64;
+    let mut skip = false;
+    let mut more = true;
+    while more {
+        while more && cnt <= ROW_BUF {
+            let blk: &[u8] = if base + 64 <= n {
+                &chunk[base..base + 64]
+            } else {
+                tail[..n - base].copy_from_slice(&chunk[base..]);
+                tail[n - base] = b'\n';
+                more = false;
+                &tail
+            };
+            let nl = eq_mask64(blk, b'\n');
+            let sep = nl | eq_mask64(blk, b',');
+            let quote = eq_mask64(blk, b'"');
+            let inner = quote & !(sep << 1 | after_sep);
+            let closed = inner << 1 | after_inner;
+            let (opened, c0) = (!sep).overflowing_add(quote ^ inner);
+            let (opened, c1) = opened.overflowing_add(open_carry);
+            let (stray, c2) = (!sep).overflowing_add(closed & !sep);
+            let (stray, c3) = stray.overflowing_add(stray_carry);
+            let bad = ((opened ^ closed) | stray) & sep | nl & (nl << 1 | after_nl);
+            after_sep = sep >> 63;
+            after_nl = nl >> 63;
+            after_inner = inner >> 63;
+            open_carry = (c0 | c1) as u64;
+            stray_carry = (c2 | c3) as u64;
+            let (mut nls, mut bads, mut quoted) = unsafe { (_pext_u64(nl, sep), _pext_u64(bad, sep), _pext_u64(closed, sep)) };
+            let mut m = sep;
+            let mut at = cnt;
+            cnt += sep.count_ones() as usize;
+            loop {
+                let out: &mut [usize; 8] = (&mut pos[at..at + 8]).try_into().unwrap();
+                for o in out {
+                    unsafe { std::ptr::write_volatile(o, base + m.trailing_zeros() as usize) };
+                    m &= m.wrapping_sub(1);
                 }
-                k = 0;
-                line = p + 1;
+                let fl = unsafe { _pdep_u64(nls, 0x0101_0101_0101_0101) | _pdep_u64(bads, 0x0202_0202_0202_0202) | _pdep_u64(quoted, 0x0404_0404_0404_0404) };
+                flags[at..at + 8].copy_from_slice(&fl.to_le_bytes());
+                if m == 0 {
+                    break;
+                }
+                at += 8;
+                nls >>= 8;
+                bads >>= 8;
+                quoted >>= 8;
             }
-            m ^= bit;
+            base += 64;
         }
-        stray_before |= stray != 0;
-        base += 64;
+        let mut i = 1usize;
+        if skip {
+            while i < cnt && flags[i] & 1 == 0 {
+                i += 1;
+            }
+            skip = i == cnt;
+            i = cnt.min(i + 1);
+        }
+        while i + N <= cnt {
+            let w = u64::from_le_bytes(flags[i..i + 8].try_into().unwrap());
+            if w & care == want {
+                let line = pos[i - 1].wrapping_add(1);
+                let mut s = line;
+                let mut out: [B<'a>; N] = [&[]; N];
+                for (k, o) in out.iter_mut().enumerate() {
+                    let q = (w >> (8 * k + 2)) as usize & 1;
+                    let e = pos[i + k];
+                    *o = unsafe { chunk.get_unchecked(s + q..e - q) };
+                    s = e + 1;
+                }
+                f(unsafe { chunk.get_unchecked(line) }, out);
+                i += N;
+            } else {
+                while i < cnt && flags[i] & 1 == 0 {
+                    i += 1;
+                }
+                skip = i == cnt;
+                i = cnt.min(i + 1);
+            }
+        }
+        pos.copy_within(i - 1..i + 15, 0);
+        flags.copy_within(i - 1..i + 15, 0);
+        cnt -= i - 1;
     }
-    for_lines(&chunk[line..], |l| {
-        if let Some(r) = split::<N>(l) {
-            f(&l[0], r);
-        }
-    });
 }
 
 #[inline]
@@ -214,6 +259,7 @@ thread_local! {
     static DAYS: [Cell<(u64, u32, i64)>; 64] = const { [const { Cell::new((0, 1, 0)) }; 64] };
 }
 
+#[cold]
 fn date(s: &[u8]) -> Option<i64> {
     if s[4] != b'-' || s[7] != b'-' || s[10] != b'T' {
         return None;
@@ -241,12 +287,12 @@ fn date(s: &[u8]) -> Option<i64> {
     Some(days_from_civil(y, mo, d) * DAY_MS)
 }
 
-#[inline]
+#[inline(always)]
 fn civil(s: &[u8]) -> Option<i64> {
     let k0 = u64::from_le_bytes(s[..8].try_into().unwrap());
     let k1 = u32::from_le_bytes(s[7..11].try_into().unwrap());
     let day = DAYS.with(|days| {
-        let slot = &days[((k1 >> 16 & 15) | (k1 >> 4 & 48)) as usize];
+        let slot = &days[unsafe { _pext_u32(k1, 0x000f_0300) } as usize];
         let (a, b, ms) = slot.get();
         if a == k0 && b == k1 {
             return Some(ms);
@@ -260,11 +306,10 @@ fn civil(s: &[u8]) -> Option<i64> {
         return None;
     }
     let t = x.wrapping_mul(0xa01);
-    let (h, mi, se) = ((t >> 8 & 255) as i64, (t >> 32 & 255) as i64, (t >> 56) as i64);
-    if h > 23 || mi > 59 || se > 59 {
+    if t.wrapping_add(0x4400_0044_0000_6800) & 0x8000_0080_0000_8000 != 0 {
         return None;
     }
-    Some(day + (h * 3600 + mi * 60 + se) * 1000)
+    Some(day + ((t >> 8 & 255) * 3_600_000 + (t >> 32 & 255) * 60_000 + (t >> 56) * 1000) as i64)
 }
 
 const POW10: [i64; 9] = [1, 10, 100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000, 100_000_000];
@@ -295,7 +340,7 @@ fn epoch(s: &[u8]) -> Option<i64> {
     Some(v)
 }
 
-#[inline]
+#[inline(always)]
 pub fn parse_ts(s: &[u8]) -> Option<i64> {
     let n = s.len();
     match n {
@@ -521,6 +566,7 @@ mod tests {
         assert_eq!(new_rows::<2>(chunk), old_rows::<2>(chunk), "{:?}", String::from_utf8_lossy(chunk));
         assert_eq!(new_rows::<4>(chunk), old_rows::<4>(chunk), "{:?}", String::from_utf8_lossy(chunk));
         assert_eq!(new_rows::<7>(chunk), old_rows::<7>(chunk), "{:?}", String::from_utf8_lossy(chunk));
+        assert_eq!(new_rows::<8>(chunk), old_rows::<8>(chunk), "{:?}", String::from_utf8_lossy(chunk));
         assert_eq!(split_rows::<2>(chunk), old_rows::<2>(chunk), "{:?}", String::from_utf8_lossy(chunk));
         assert_eq!(split_rows::<7>(chunk), old_rows::<7>(chunk), "{:?}", String::from_utf8_lossy(chunk));
     }
@@ -715,6 +761,10 @@ mod tests {
         assert_eq!(split::<2>(b"a,b\""), None);
         assert_eq!(split::<2>(b"a,b,c"), None);
         assert_eq!(split::<2>(b"a"), None);
+        let l = b"\"e1\",u 1,x,y";
+        assert_eq!(unsafe { first(&l[0]) }, &b"e1"[..]);
+        let l = b",\"\",x";
+        assert_eq!(unsafe { first(&l[0]) }, &b""[..]);
     }
     #[test]
     fn lines() {
