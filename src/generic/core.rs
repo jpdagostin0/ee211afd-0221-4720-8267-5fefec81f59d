@@ -397,54 +397,77 @@ pub struct Id<'a> {
 }
 
 #[derive(Clone, Copy)]
-#[repr(align(32))]
-struct Slot {
-    k: [u64; 2],
-    tag: u8,
-    name: u32,
+#[repr(C, align(64))]
+struct Bucket {
+    k: [[u64; 2]; 3],
+    tag: [u8; 3],
+    name: [u32; 3],
+}
+
+impl Bucket {
+    #[inline(always)]
+    fn find(&self, tag: u8, k: [u64; 2]) -> Option<usize> {
+        let at = |j: usize| ((self.k[j][0] == k[0]) & (self.k[j][1] == k[1]) & (self.tag[j] == tag)) as u32;
+        let m = at(0) | at(1) << 1 | at(2) << 2;
+        (m != 0).then(|| m.trailing_zeros() as usize)
+    }
 }
 
 pub struct LinkMap<'a> {
-    slots: Vec<Slot>,
+    buckets: Vec<Bucket>,
+    seen: Vec<u64>,
     ids: Vec<B<'a>>,
+}
+
+#[inline(always)]
+fn seen_at(h: u64, words: usize) -> (usize, u64) {
+    ((h >> 32) as usize & (words - 1), 1 << (h >> 58) | 1 << (h >> 52 & 63))
 }
 
 impl LinkMap<'_> {
     pub fn release(self) {
-        advise(self.slots.as_ptr(), self.slots.len(), MADV_DONTNEED);
+        advise(self.buckets.as_ptr(), self.buckets.len(), MADV_DONTNEED);
     }
     #[inline]
     fn prefetch(&self, h: u64) {
-        prefetch(&self.slots[h as usize & (self.slots.len() - 1)]);
+        let (w, bits) = seen_at(h, self.seen.len());
+        let word = &self.seen[w];
+        let b = &self.buckets[h as usize & (self.buckets.len() - 1)] as *const Bucket as *const i8;
+        unsafe { _mm_prefetch::<_MM_HINT_T0>(std::hint::select_unpredictable(*word & bits == bits, b, word as *const u64 as *const i8)) }
     }
     #[inline]
     fn person(&self, tag: u8, k: [u64; 2], h: u64) -> (u8, [u64; 2]) {
-        let mask = self.slots.len() - 1;
+        let (w, bits) = seen_at(h, self.seen.len());
+        if self.seen[w] & bits != bits {
+            return (tag, k);
+        }
+        let mask = self.buckets.len() - 1;
         let mut i = h as usize & mask;
         loop {
-            let s = &self.slots[i];
-            if s.name == 0 {
-                return (tag, k);
+            let b = &self.buckets[i];
+            if let Some(j) = b.find(tag, k) {
+                return (T_LINK, [(b.name[j] - 1) as u64, 0]);
             }
-            if s.k == k && s.tag == tag {
-                return (T_LINK, [(s.name - 1) as u64, 0]);
+            if b.name[2] == 0 {
+                return (tag, k);
             }
             i = (i + 1) & mask;
         }
     }
 }
 
-fn find(parent: &mut [u32], mut x: u32) -> u32 {
-    let mut r = x;
-    while parent[r as usize] != r {
-        r = parent[r as usize];
+fn union(parent: &mut [u32], [mut x, mut y]: [u32; 2]) {
+    while parent[x as usize] != parent[y as usize] {
+        if parent[x as usize] < parent[y as usize] {
+            (x, y) = (y, x);
+        }
+        let px = parent[x as usize];
+        parent[x as usize] = parent[y as usize];
+        if px == x {
+            return;
+        }
+        x = px;
     }
-    while parent[x as usize] != r {
-        let n = parent[x as usize];
-        parent[x as usize] = r;
-        x = n;
-    }
-    r
 }
 
 pub type LinkPart<'a> = Vec<[Id<'a>; 2]>;
@@ -465,13 +488,14 @@ pub fn parse_links(c: B<'_>) -> LinkPart<'_> {
 
 pub fn build_links<'a>(parts: &[LinkPart<'a>], huge: bool) -> LinkMap<'a> {
     let n: usize = parts.iter().map(|p| p.len()).sum();
-    let mask = (4 * n).next_power_of_two().max(16) - 1;
-    let mut slots: Vec<Slot> = Vec::with_capacity(mask + 1);
+    let mask = n.next_power_of_two().max(16) - 1;
+    let mut buckets: Vec<Bucket> = Vec::with_capacity(mask + 1);
     if huge {
-        advise(slots.as_ptr(), mask + 1, MADV_HUGEPAGE);
+        advise(buckets.as_ptr(), mask + 1, MADV_HUGEPAGE);
     }
-    advise(slots.as_ptr(), mask + 1, MADV_POPULATE_WRITE);
-    slots.resize(mask + 1, Slot { k: [0; 2], tag: 0, name: 0 });
+    advise(buckets.as_ptr(), mask + 1, MADV_POPULATE_WRITE);
+    buckets.resize(mask + 1, Bucket { k: [[0; 2]; 3], tag: [0; 3], name: [0; 3] });
+    let mut seen = vec![0u64; (mask + 1).div_ceil(8)];
     let mut ids: Vec<B<'a>> = Vec::with_capacity(n + n / 2);
     let mut parent: Vec<u32> = Vec::with_capacity(n + n / 2);
     advise(ids.as_ptr(), ids.capacity(), MADV_POPULATE_WRITE);
@@ -479,50 +503,67 @@ pub fn build_links<'a>(parts: &[LinkPart<'a>], huge: bool) -> LinkMap<'a> {
     for p in parts {
         for blk in p.chunks(16) {
             for id in blk.iter().flatten() {
-                prefetch(&slots[khash(id.tag, id.k) as usize & mask]);
+                prefetch(&buckets[khash(id.tag, id.k) as usize & mask]);
             }
-            for l in blk {
-                let xy: [u32; 2] = l.map(|id| {
-                    let mut i = khash(id.tag, id.k) as usize & mask;
+            let mut xys = [[0u32; 2]; 16];
+            for (xy, l) in xys.iter_mut().zip(blk) {
+                *xy = l.map(|id| {
+                    let h = khash(id.tag, id.k);
+                    let mut i = h as usize & mask;
                     loop {
-                        let s = &mut slots[i];
-                        if s.name == 0 {
+                        let b = &mut buckets[i];
+                        if let Some(j) = b.find(id.tag, id.k) {
+                            return b.name[j] - 1;
+                        }
+                        if b.name[2] == 0 {
+                            let j = (b.name[0] != 0) as usize + (b.name[1] != 0) as usize;
+                            let (w, bits) = seen_at(h, seen.len());
+                            seen[w] |= bits;
                             parent.push(ids.len() as u32);
                             ids.push(id.text);
-                            *s = Slot { k: id.k, tag: id.tag, name: ids.len() as u32 };
-                        }
-                        if s.k == id.k && s.tag == id.tag {
-                            return s.name - 1;
+                            (b.k[j], b.tag[j], b.name[j]) = (id.k, id.tag, ids.len() as u32);
+                            return b.name[j] - 1;
                         }
                         i = (i + 1) & mask;
                     }
                 });
-                let rx = find(&mut parent, xy[0]);
-                let ry = find(&mut parent, xy[1]);
-                if rx < ry {
-                    parent[ry as usize] = rx
-                } else {
-                    parent[rx as usize] = ry
-                }
+                prefetch(&parent[xy[0] as usize]);
+                prefetch(&parent[xy[1] as usize]);
+            }
+            for &xy in &xys[..blk.len()] {
+                union(&mut parent, xy);
             }
         }
     }
     for i in 0..parent.len() {
+        if let Some(&p) = parent.get(i + 16) {
+            prefetch(&parent[p as usize]);
+        }
         parent[i] = parent[parent[i] as usize];
     }
     let mut min_of: Vec<u32> = (0..ids.len() as u32).collect();
-    for (i, &r) in parent.iter().enumerate() {
-        if ids[i] < ids[min_of[r as usize] as usize] {
-            min_of[r as usize] = i as u32;
+    for i in 0..parent.len() {
+        if let Some(&r) = parent.get(i + 32) {
+            prefetch(&min_of[r as usize]);
+        }
+        if let Some(&r) = parent.get(i + 16) {
+            prefetch(&ids[min_of[r as usize] as usize]);
+        }
+        if let Some(&r) = parent.get(i + 8) {
+            prefetch(&ids[min_of[r as usize] as usize][0]);
+        }
+        let r = parent[i] as usize;
+        if ids[i] < ids[min_of[r] as usize] {
+            min_of[r] = i as u32;
         }
     }
     let canon: Vec<u32> = parent.iter().map(|&r| min_of[r as usize] + 1).collect();
-    for s in &mut slots {
-        if s.name != 0 {
-            s.name = canon[s.name as usize - 1];
+    for x in buckets.iter_mut().flat_map(|b| &mut b.name) {
+        if *x != 0 {
+            *x = canon[*x as usize - 1];
         }
     }
-    LinkMap { slots, ids }
+    LinkMap { buckets, seen, ids }
 }
 
 
@@ -535,13 +576,9 @@ pub const T_INVALID: u32 = 255;
 pub struct Ev {
     eid: [u64; 2],
     user: [u64; 2],
-    ingest: i64,
+    win: u64,
     ts: u32,
     pt: u32,
-    cat: u32,
-    etag: u8,
-    utag: u8,
-    chunk: u16,
 }
 
 #[derive(Clone, Copy)]
@@ -566,6 +603,7 @@ pub struct Parsed {
     arena: Arena,
     ev: Bins<Ev>,
     side: Vec<Vec<u8>>,
+    cats: Vec<Vec<u32>>,
 }
 impl Parsed {
     pub fn finish(&mut self) {
@@ -575,7 +613,7 @@ impl Parsed {
         self.arena.release();
     }
     pub fn new(nshard: usize, huge: bool) -> Self {
-        Parsed { arena: Arena::new(huge), ev: Bins::new(nshard), side: vec![Vec::new(); nshard] }
+        Parsed { arena: Arena::new(huge), ev: Bins::new(nshard), side: vec![Vec::new(); nshard], cats: vec![Vec::new(); nshard] }
     }
 }
 
@@ -587,7 +625,7 @@ pub struct EvCtx<'a> {
     pub unknown_cat: u32,
 }
 
-pub fn parse_events(c: B<'_>, chunk: u16, ctx: &EvCtx<'_>, out: &mut Parsed) {
+pub fn parse_events(c: B<'_>, ctx: &EvCtx<'_>, out: &mut Parsed) {
     let nshard = out.side.len();
     for_rows(c, |_, [eid, user, ts, ingest, typ, product, price]: [B; 7]| {
         if eid.is_empty() {
@@ -595,7 +633,8 @@ pub fn parse_events(c: B<'_>, chunk: u16, ctx: &EvCtx<'_>, out: &mut Parsed) {
         }
         let Some(ingest) = parse_ts(ingest) else { return };
         let (etag, ek) = key_of(eid);
-        let mut e = Ev { eid: ek, user: [0; 2], ingest, ts: 0, pt: T_INVALID << 24, cat: 0, etag, utag: 0, chunk };
+        let s = shard_of(khash(etag, ek), nshard);
+        let mut e = Ev { eid: ek, user: [0; 2], win: ((ingest / 1000 + (1 << 38)) as u64) << 16 | etag as u64, ts: 0, pt: T_INVALID << 24 };
         'v: {
             if user.is_empty() || product.is_empty() {
                 break 'v;
@@ -611,16 +650,19 @@ pub fn parse_events(c: B<'_>, chunk: u16, ctx: &EvCtx<'_>, out: &mut Parsed) {
                 _ => break 'v,
             };
             let mut pr = 0u32;
+            let mut cat = 0u32;
             if ty == T_PURCHASE {
                 let Some(p) = parse_price(price) else { break 'v };
                 pr = p;
-                e.cat = ctx.products.get(product).unwrap_or(ctx.unknown_cat);
+                cat = ctx.products.get(product).unwrap_or(ctx.unknown_cat);
             }
             if ingest - t > DAY_MS {
                 break 'v;
             }
-            (e.utag, e.user) = key_of(user);
-            if e.utag == T_LONG {
+            let utag;
+            (utag, e.user) = key_of(user);
+            e.win |= (utag as u64) << 8;
+            if utag == T_LONG {
                 let side = &mut out.side[shard_of(khash(T_LONG, e.user), nshard)];
                 side.extend_from_slice(&e.user[0].to_le_bytes());
                 side.extend_from_slice(&e.user[1].to_le_bytes());
@@ -629,8 +671,11 @@ pub fn parse_events(c: B<'_>, chunk: u16, ctx: &EvCtx<'_>, out: &mut Parsed) {
             }
             e.ts = (t - ctx.lo) as u32;
             e.pt = pr | (ty << 24);
+            if ty == T_PURCHASE {
+                out.cats[s].push(cat);
+            }
         }
-        out.ev.push(&mut out.arena, shard_of(khash(etag, ek), nshard), e);
+        out.ev.push(&mut out.arena, s, e);
     });
     unsafe { _mm_sfence() };
 }
@@ -638,12 +683,10 @@ pub fn parse_events(c: B<'_>, chunk: u16, ctx: &EvCtx<'_>, out: &mut Parsed) {
 #[derive(Clone, Copy)]
 struct Hit {
     eid: [u64; 2],
-    ingest: i64,
+    win: u64,
     h: u64,
     slot: u32,
     idx: u32,
-    chunk: u16,
-    etag: u8,
 }
 
 pub struct Routed<'a> {
@@ -681,17 +724,19 @@ pub fn dedup_route(parsed: &[Parsed], s: usize, links: &LinkMap<'_>, nshard: usi
     let mut hs = [0u64; BATCH];
     let mut first = 0;
     for p in parsed {
+        let mut cats = p.cats[s].iter();
         for b in p.ev.blocks(s) {
             for (c, sub) in b.chunks(BATCH).enumerate() {
                 for (i, e) in sub.iter().enumerate() {
-                    hs[i] = khash(e.etag, e.eid);
+                    hs[i] = khash(e.win as u8, e.eid);
                     prefetch(&out.tab.slots[hs[i] as usize & (out.tab.slots.len() - 1)]);
-                    out.sel.push(Rec { k: e.user, ts: e.ts, pt: e.pt, cat: e.cat, tag: e.utag });
+                    let cat = if e.pt >> 24 == T_PURCHASE { *cats.next().unwrap() } else { 0 };
+                    out.sel.push(Rec { k: e.user, ts: e.ts, pt: e.pt, cat, tag: (e.win >> 8) as u8 });
                 }
                 for (i, (e, &h)) in sub.iter().zip(&hs).enumerate() {
                     let idx = (first + c * BATCH + i) as u32;
                     match out.tab.find(h, |_| true) {
-                        Ok((slot, _)) => out.hits.push(Hit { eid: e.eid, ingest: e.ingest, h, slot: slot as u32, idx, chunk: e.chunk, etag: e.etag }),
+                        Ok((slot, _)) => out.hits.push(Hit { eid: e.eid, win: e.win, h, slot: slot as u32, idx }),
                         Err(slot) => out.tab.set(slot, h, idx),
                     }
                 }
@@ -704,13 +749,13 @@ pub fn dedup_route(parsed: &[Parsed], s: usize, links: &LinkMap<'_>, nshard: usi
         if let Some(n) = out.hits.get(j + 16) {
             let o = at(out.tab.held(n.slot as usize));
             prefetch(unsafe { &*o });
-            prefetch(unsafe { &(*o).chunk });
+            prefetch(unsafe { &(*o).win });
         }
         let x = out.hits[j];
-        match out.tab.find_from(x.h, x.slot as usize, |i| unsafe { (*at(i)).eid == x.eid && (*at(i)).etag == x.etag }) {
+        match out.tab.find_from(x.h, x.slot as usize, |i| unsafe { (*at(i)).eid == x.eid && (*at(i)).win as u8 == x.win as u8 }) {
             Ok((slot, cur)) => {
                 let o = at(cur);
-                let lose = if (x.ingest, x.chunk, x.idx) < unsafe { ((*o).ingest, (*o).chunk, cur) } {
+                let lose = if (x.win >> 16, x.idx) < unsafe { ((*o).win >> 16, cur) } {
                     out.tab.set(slot, x.h, x.idx);
                     cur
                 } else {

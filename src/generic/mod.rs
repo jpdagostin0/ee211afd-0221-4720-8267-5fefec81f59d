@@ -110,7 +110,7 @@ pub fn run(data_dir: &Path, out_dir: &Path, ncpu: usize) -> io::Result<()> {
             }
         } else {
             prefault(ev_chunks[i - nl]);
-            parse_events(ev_chunks[i - nl], (i - nl) as u16, &ectx, st);
+            parse_events(ev_chunks[i - nl], &ectx, st);
             release(ev_chunks[i - nl]);
         }
     });
